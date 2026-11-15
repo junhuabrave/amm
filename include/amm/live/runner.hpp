@@ -82,6 +82,9 @@ class Runner {
     if (now_ >= next_timer_) {
       eng_.on_timer(now_);
       next_timer_ = now_ + ns(opt_.timer_s);
+      const double v = pnl();  // drawdown sampled on the timer clock
+      peak_pnl_ = std::max(peak_pnl_, v);
+      max_dd_ = std::max(max_dd_, peak_pnl_ - v);
     }
     if (opt_.status_every_s > 0 && opt_.log && now_ >= next_status_) {
       status(*opt_.log);
@@ -103,6 +106,8 @@ class Runner {
   double position(InstrumentId i) const { return acct_[i].pos; }
   double peak_position(InstrumentId i) const { return acct_[i].peak; }  // largest |position| reached
   uint64_t fills() const { return fills_; }
+  double volume() const { return volume_; }
+  double max_drawdown() const { return max_dd_; }  // of P&L sampled every timer_s
   uint64_t events() const { return events_; }
   bool warm() const { return warm_; }
   double elapsed_s() const { return first_ts_ < 0 ? 0.0 : secs(now_ - first_ts_); }
@@ -196,7 +201,7 @@ class Runner {
   TimeNs now_ = 0, first_ts_ = -1, next_timer_ = 0, next_status_ = 0;
   bool warm_ = false;
   uint64_t events_ = 0, unknown_ = 0, bad_lines_ = 0, fills_ = 0;
-  double volume_ = 0.0;
+  double volume_ = 0.0, peak_pnl_ = 0.0, max_dd_ = 0.0;
 };
 
 }  // namespace amm::live

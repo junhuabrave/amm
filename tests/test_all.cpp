@@ -843,6 +843,67 @@ TEST(calibration_recovers_volatility_and_fill_curve) {
   CHECK(c.symbols[1].A == 0.0);  // no trades on Y: reported as not identifiable
 }
 
+TEST(calibration_vol_survives_a_mid_that_mostly_sits_still) {
+  // Real tapes: the mid is unchanged in about half of all 1 s samples and moves
+  // by several ticks in the rest, with occasional jumps on top. A median-based
+  // scale collapses to zero or one tick there; truncation must not.
+  std::mt19937_64 rng(11);
+  std::normal_distribution<double> N;
+  std::uniform_real_distribution<double> U(0.0, 1.0);
+  const double vol = 0.2, p_move = 0.4, jump = 15 * vol, jump_rate = 1.0 / 200, tick = 0.01;
+  const int secs_n = 8000;
+  std::ostringstream os;
+  double mid = 1800.0;
+  int still = 0, jumps = 0;
+  for (int i = 0; i < secs_n; ++i) {
+    const double before = mid;
+    if (U(rng) < p_move) mid += vol / std::sqrt(p_move) * N(rng);
+    if (U(rng) < jump_rate) { mid += U(rng) < 0.5 ? -jump : jump; ++jumps; }
+    const double q = std::round(mid / (0.5 * tick)) * 0.5 * tick;
+    if (q == std::round(before / (0.5 * tick)) * 0.5 * tick) ++still;
+    MdEvent b; b.ts = ns(i) + 1; b.type = 'B'; b.sym = "E";
+    b.a = q - 0.5 * tick; b.b = 5; b.c = q + 0.5 * tick; b.d = 5;
+    os << format_event(b) << '\n';
+  }
+  CHECK(still > secs_n / 2);  // the regime that broke the median estimator
+  std::istringstream in(os.str());
+  const Calibration c = calibrate(in);
+  CHECK(c.symbols.size() == 1);
+  const SymbolCalibration& e = c.symbols[0];
+  NEAR(e.vol, vol, 0.1 * vol);
+  NEAR(e.jump_rate, jumps / double(secs_n), 0.3 * jumps / double(secs_n));
+  NEAR(e.jump_sd, jump, 0.15 * jump);
+  CHECK(e.vol_total > e.vol);
+}
+
+TEST(sweep_overrides_config_keys_by_section) {
+  const std::string base =
+      "[engine]\ngamma = 0.05   ; risk aversion\n[factor BTC]\nlevel = 1\nvol = 2\n"
+      "[instrument A]\nfeed = X:A\nquote_size = 1\npricer = linear BTC\nref_for = BTC\n"
+      "[instrument B]\nfeed = X:B\npricer = linear BTC\n";
+  auto parse = [](const std::string& t) { std::istringstream is(t); return parse_config(is); };
+  // replaced in place, comment and all
+  LiveConfig c = parse(set_ini_value(base, "engine", "gamma", "0.2"));
+  NEAR(c.engine.gamma, 0.2, 1e-12);
+  // added when the section lacks the key; ':' stands in for the space
+  c = parse(set_ini_value(base, "engine", "min_quote_life_ms", "500"));
+  NEAR(c.engine.min_quote_life_s, 0.5, 1e-12);
+  NEAR(c.engine.gamma, 0.05, 1e-12);
+  c = parse(set_ini_value(base, "factor:BTC", "vol", "7"));
+  NEAR(c.factors[0].vol, 7.0, 1e-12);
+  // one named instrument, or all of them; B has no quote_size line to replace
+  c = parse(set_ini_value(base, "instrument:B", "quote_size", "3"));
+  NEAR(c.instruments[0].in.quote_size, 1.0, 1e-12);
+  NEAR(c.instruments[1].in.quote_size, 3.0, 1e-12);
+  c = parse(set_ini_value(base, "instrument *", "max_pos", "9"));
+  NEAR(c.instruments[0].in.max_pos, 9.0, 1e-12);
+  NEAR(c.instruments[1].in.max_pos, 9.0, 1e-12);
+  CHECK(c.instruments[1].feed == "X:B");
+  bool threw = false;
+  try { set_ini_value(base, "instrument:C", "tick", "1"); } catch (const std::runtime_error&) { threw = true; }
+  CHECK(threw);  // a typo must not silently sweep nothing
+}
+
 int main(int argc, char** argv) {
   const std::string filter = argc > 1 ? argv[1] : "";
   int ran = 0;

@@ -30,7 +30,7 @@ See [docs/DESIGN.md](docs/DESIGN.md) for scope, design and roadmap, and
 
 ```sh
 cmake -S . -B build && cmake --build build     # or: ./build.sh  (g++ >= 11 only)
-./build/amm_tests                              # 39 tests
+./build/amm_tests                              # 41 tests
 python3 feeds/test_feeds.py                    # adapter tests, offline
 ./build/amm_sim --seeds 24 --duration 1800 --detail
 ./build/amm_bench
@@ -52,6 +52,10 @@ python3 feeds/binance.py BTCUSDT ETHUSDT --perp BTCUSDT | ./build/amm_run --conf
 # replay the recorded session (identical result), then calibrate from it
 ./build/amm_run --config config/crypto.ini --replay data/session.csv
 ./build/amm_calibrate data/session.csv
+
+# backtest a grid of settings on the same recording (parallel; --split N shows P&L by time slice)
+./build/amm_sweep --config config/binance_perp.ini --replay data/session.csv \
+  --set engine.gamma=0.01,0.05,0.2 --set engine.min_quote_life_ms=0,250,1000 --split 4
 
 # no network: try the same pipe on a synthetic stream, or on a simulator journal
 python3 feeds/synthetic.py --seconds 600 | ./build/amm_run --config config/crypto.ini
@@ -116,7 +120,7 @@ include/amm/          engine library (core, factor, pricing, signals, quoter, li
 include/amm/sim/      matching engine, market simulator, reference scenario
 include/amm/live/     event format, config loader, paper venue, runner, calibration
 apps/                 amm_sim (comparison), amm_bench (latency), amm_run (paper trading),
-                      amm_calibrate, amm_record_sim
+                      amm_calibrate, amm_sweep (replay grid), amm_record_sim
 feeds/                venue adapters (Binance, Coinbase, synthetic) and their tests
 config/               sim.ini (reference universe), crypto.ini (starter live universe)
 tests/                unit and end-to-end tests

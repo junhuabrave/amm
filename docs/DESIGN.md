@@ -400,6 +400,7 @@ of each other and of the engine.
 | Paper venue | `live/paper.hpp` | Matches our orders locally against the real book and prints |
 | Runner | `live/runner.hpp`, `apps/amm_run.cpp` | Reads events from a pipe or a file, drives engine and venue, records, reports |
 | Calibration | `live/calibrate.hpp`, `apps/amm_calibrate.cpp` | Volatility, jumps, correlation, spreads and fill curve from a journal |
+| Parameter sweep | `apps/amm_sweep.cpp` | Replays one journal under a grid of config overrides, in parallel; P&L, drawdown, order rate, peak positions, P&L by time slice |
 | Adapters | `feeds/*.py` | Binance spot and perpetuals (REST polling, and websockets in `binance_ws.py` over `ws.py`), Coinbase; standard library only |
 | Sample data | `apps/amm_record_sim.cpp`, `feeds/synthetic.py` | Journals and a live-style stream with no network |
 
@@ -441,19 +442,38 @@ estimate of spread capture.
 instrument has a market, and feeds factor reference markets first, so factor
 levels come from the market and never from the rough values in the config.
 
-**Calibration.** Volatility is a robust (median-based) estimate from one-second
-mid changes, with moves beyond five robust sigmas reported separately as
-jumps. The fill curve is measured the way a resting quote experiences it: a
+**Calibration.** Volatility is estimated from one-second mid changes by
+iterated truncation: start from the total, set aside moves beyond five
+sigmas as jumps, re-estimate from the rest, and repeat until the set of jumps
+stops changing. An earlier median-based scale failed on real tapes: Binance
+perpetual mids are unchanged in about half of all one-second samples (BTC 60%,
+ETH 48% on 2026-11-15), so the median move is zero or one tick, and ETH showed
+a diffusive vol of 0.015 with almost every ordinary move labelled a jump.
+Truncation gives 0.184 for ETH with two jumps in 15 minutes. Volatility
+measured over 1 to 60 second horizons is flat on these tapes (4.4 to 4.6 for
+BTC, 0.17 to 0.19 for ETH), so one-second sampling is not inflated by
+bid-ask bounce in the mid. The fill curve is measured the way a resting quote experiences it: a
 hypothetical quote is placed at each distance from the prevailing mid and
 counted as filled when a trade prints at or through it within the horizon.
 Public prints identify the curve at and beyond the touch only; inside the
 spread it is an extrapolation that the engine's online estimator then corrects
 from its own fills.
 
+**Backtesting.** Replay is the backtest: a journal recorded live (or from the
+simulator) runs through the same runner and paper venue, and gives the same
+result every time. `amm_sweep` replays one journal under a grid of config
+overrides (`--set engine.gamma=0.01,0.05,0.2`, `--set instrument:*.max_pos=...`)
+on all cores and tabulates P&L, drawdown, order rate, how close each
+instrument came to its limit, and P&L per time slice (`--split N`). A
+15-minute journal replays in about 0.4 s. The same downward bias applies, and
+a setting chosen on one session is fitted to it: choose on one recording and
+confirm on another.
+
 **Verified and not verified.** Tests cover the event format, the config
 files, the paper venue's fill rules, replay determinism (a session recorded
-live replays to the identical result), warm-up, calibration against a tape
-with known parameters, the websocket framing and handshake, and the position
+live replays to the identical result), warm-up, calibration against tapes
+with known parameters (including a mid that sits still for most samples),
+config overrides for sweeps, the websocket framing and handshake, and the position
 limit under quote flicker with orders in flight. The adapters' parsers are
 tested against responses and stream messages captured from the live Binance
 spot, Binance perpetual and Coinbase endpoints on 2026-11-15.

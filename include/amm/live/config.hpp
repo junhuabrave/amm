@@ -175,6 +175,57 @@ inline LiveConfig parse_config(std::istream& is, const std::string& name = "conf
   return cfg;
 }
 
+// Returns `text` with `key = value` set in every section matching `section`:
+// "engine", "paper", "factor BTC", "instrument ETH-USDT-PERP", or a kind with
+// "*" ("instrument *") for all of that kind. An existing key is replaced in
+// place, otherwise the line is added after the section header. Throws when no
+// section matches, so a typo cannot silently sweep nothing.
+inline std::string set_ini_value(const std::string& text, std::string section, const std::string& key,
+                                 const std::string& value) {
+  using detail::trim;
+  for (char& ch : section) if (ch == ':') ch = ' ';
+  section = trim(section);
+  const size_t sp = section.find(' ');
+  const std::string want_kind = section.substr(0, sp), want_arg = sp == std::string::npos ? "" : trim(section.substr(sp));
+  std::istringstream is(text);
+  std::vector<std::string> lines;
+  for (std::string l; std::getline(is, l);) lines.push_back(l);
+  const std::string kv = key + " = " + value;
+  int matched = 0;
+  std::vector<std::string> out;
+  bool in_match = false, done = false;
+  size_t header_at = 0;
+  for (const std::string& raw : lines) {
+    std::string l = raw;
+    const size_t hash = l.find_first_of(";#");
+    if (hash != std::string::npos) l.erase(hash);
+    l = trim(l);
+    if (!l.empty() && l.front() == '[' && l.back() == ']') {
+      if (in_match && !done) out.insert(out.begin() + static_cast<long>(header_at) + 1, kv);
+      in_match = false;
+      const std::string h = trim(l.substr(1, l.size() - 2));
+      const size_t hs = h.find_first_of(" \t");
+      const std::string kind = h.substr(0, hs), arg = hs == std::string::npos ? "" : trim(h.substr(hs));
+      out.push_back(raw);
+      if (kind == want_kind && (want_arg == "*" || arg == want_arg)) {
+        in_match = true; done = false; header_at = out.size() - 1; ++matched;
+      }
+      continue;
+    }
+    const size_t eq = l.find('=');
+    if (in_match && eq != std::string::npos && trim(l.substr(0, eq)) == key) {
+      out.push_back(kv); done = true;
+      continue;
+    }
+    out.push_back(raw);
+  }
+  if (in_match && !done) out.insert(out.begin() + static_cast<long>(header_at) + 1, kv);
+  if (!matched) throw std::runtime_error("no [" + section + "] section to set '" + key + "' in");
+  std::string r;
+  for (const auto& l : out) r += l + '\n';
+  return r;
+}
+
 inline LiveConfig load_config(const std::string& path) {
   std::ifstream f(path);
   if (!f) throw std::runtime_error("cannot open config file: " + path);

@@ -17,9 +17,9 @@ struct SymbolCalibration {
   std::string sym;
   double duration_s = 0, books = 0, trades = 0;
   double mid = 0, mean_spread = 0, min_increment = 0;
-  double vol = 0;        // robust (jump-free) st.dev of the mid per sqrt(second)
+  double vol = 0;        // diffusive (jump-free) st.dev of the mid per sqrt(second)
   double vol_total = 0;  // including jumps
-  double jump_rate = 0, jump_sd = 0;  // 1 s moves beyond 5 robust sigmas
+  double jump_rate = 0, jump_sd = 0;  // sampled moves beyond jump_sigmas diffusive sigmas
   double trade_rate = 0; // prints per second, per side
   double A = 0, k = 0;   // fill intensity per side; 0 if not identifiable
   int intensity_points = 0;
@@ -33,6 +33,7 @@ struct CalibrationOptions {
   double sample_s = 1.0;    // sampling interval for volatility and quote starts
   double horizon_s = 10.0;  // how long a hypothetical quote is left to rest
   int levels = 8;           // distances tested
+  double jump_sigmas = 5.0; // a sampled move beyond this many diffusive sigmas is a jump
 };
 
 // Fill intensity is measured the way a resting quote experiences it: at each
@@ -105,17 +106,29 @@ inline Calibration calibrate(std::istream& in, CalibrationOptions opt = {}) {
       if (g[i] == g[i] && g[i - 1] == g[i - 1]) { dg[i - 1] = g[i] - g[i - 1]; r.push_back(dg[i - 1]); }
     grids.push_back(dg);
     if (r.size() >= 10) {
-      std::vector<double> a(r.size());
-      for (size_t i = 0; i < r.size(); ++i) a[i] = std::fabs(r[i]);
-      std::nth_element(a.begin(), a.begin() + static_cast<long>(a.size() / 2), a.end());
-      double robust = 1.4826 * a[a.size() / 2];
+      // Jump-robust volatility by iterated truncation (Mancini): start from the
+      // total, drop moves beyond 5 sigma, re-estimate, repeat until the set of
+      // jumps stops changing. A median-based scale fails on real tapes, where
+      // the mid sits still for half of all 1 s samples: the median move is
+      // zero or one tick, and every ordinary move then looks like a jump.
       double v = 0;
       for (double x : r) v += x * x;
       c.vol_total = std::sqrt(v / r.size() / opt.sample_s);
-      if (robust <= 0) robust = std::sqrt(v / r.size());  // mid mostly static between samples
-      c.vol = robust / std::sqrt(opt.sample_s);
-      double js = 0; int jn = 0;
-      for (double x : r) if (std::fabs(x) > 5.0 * robust) { js += x * x; ++jn; }
+      double sd = std::sqrt(v / r.size());
+      int jn = 0;
+      for (int it = 0; it < 50 && sd > 0; ++it) {
+        double kept = 0; int n_kept = 0, n_jump = 0;
+        for (double x : r)
+          if (std::fabs(x) > opt.jump_sigmas * sd) ++n_jump;
+          else { kept += x * x; ++n_kept; }
+        const double next = n_kept ? std::sqrt(kept / n_kept) : sd;
+        const bool done = n_jump == jn && std::fabs(next - sd) <= 1e-12 * sd;
+        sd = next; jn = n_jump;
+        if (done) break;
+      }
+      c.vol = sd / std::sqrt(opt.sample_s);
+      double js = 0; jn = 0;
+      for (double x : r) if (std::fabs(x) > opt.jump_sigmas * sd) { js += x * x; ++jn; }
       c.jump_rate = jn / (r.size() * opt.sample_s);
       c.jump_sd = jn ? std::sqrt(js / jn) : 0.0;
     }
