@@ -111,6 +111,11 @@ class Sim final : public Venue {
   }
 
   void attach(Engine* e) { eng_ = e; }
+  // Observer of the public market (books excluding the engine's own orders,
+  // trade prints, composites): type 'B' (bid, bid_sz, ask, ask_sz), 'T' (px,
+  // qty, +1/-1 aggressor), 'C' (px). With no engine attached the simulator
+  // runs the market alone, which is how sample journals are recorded.
+  std::function<void(TimeNs, char, InstrumentId, double, double, double, double)> tap;
   double now_s() const { return secs(now_); }
   double true_px(InstrumentId i) const {
     return inst_[i].pricer->price(truth_.levels(), secs(now_) / secs_per_year).px + inst_[i].idio;
@@ -129,7 +134,7 @@ class Sim final : public Venue {
   SimResult run() {
     res_.inst_sniped.assign(inst_.size(), 0.0);
     res_.inst_edge.assign(inst_.size(), 0.0);
-    eng_->start(0);
+    if (eng_) eng_->start(0);
     at(0, [this] { grid(0); });
     const TimeNs end = ns(cfg_.duration_s);
     while (!q_.empty()) {
@@ -220,12 +225,14 @@ class Sim final : public Venue {
           at(now_ + ns(uni() * dt), [this, id] { rfq(id); });
         if (secs(now_) >= inst_[i].next_composite) {
           inst_[i].next_composite += d.composite_every_s;
-          eng_->on_composite(id, true_px(id) + d.composite_noise * gauss(), now_);
+          const double cpx = true_px(id) + d.composite_noise * gauss();
+          if (tap) tap(now_, 'C', id, cpx, 0, 0, 0);
+          if (eng_) eng_->on_composite(id, cpx, now_);
         }
       }
     }
     const uint64_t timer_steps = std::max<uint64_t>(1, std::llround(cfg_.timer_s / dt));
-    if (k % timer_steps == 0) at(now_ + ns(cfg_.md_lat_s), [this] { eng_->on_timer(now_); });
+    if (eng_ && k % timer_steps == 0) at(now_ + ns(cfg_.md_lat_s), [this] { eng_->on_timer(now_); });
     const uint64_t sec_steps = std::max<uint64_t>(1, std::llround(1.0 / dt));
     if (k % sec_steps == 0) res_.pnl_path.push_back(mm_pnl());
     at(ns((k + 1) * dt), [this, k] { grid(k + 1); });
@@ -292,9 +299,11 @@ class Sim final : public Venue {
   }
 
   void settle(InstrumentId i, Side taker_side, const std::vector<Exec>& ex, bool sniped) {
-    for (const auto& e : ex)
+    for (const auto& e : ex) {
+      if (tap) tap(now_, 'T', i, inst_[i].book.to_px(e.px_ticks), e.qty, sgn(taker_side), 0);
       if (e.maker_owner == kMM)
         mm_fill(i, opp(taker_side), inst_[i].book.to_px(e.px_ticks), e.qty, e.maker_id, false, sniped);
+    }
   }
 
   void mm_fill(InstrumentId i, Side side, double px, double qty, OrderId oid, bool hedge, bool sniped) {
@@ -317,7 +326,8 @@ class Sim final : public Venue {
     TopOfBook t = x.book.top_excluding(kMM);
     if (t.bid == x.pub.bid && t.ask == x.pub.ask && t.bid_sz == x.pub.bid_sz && t.ask_sz == x.pub.ask_sz) return;
     x.pub = t;
-    at(now_ + ns(cfg_.md_lat_s), [this, i, t]() mutable { t.ts = now_; eng_->on_book(i, t); });
+    if (tap && t.valid()) tap(now_, 'B', i, t.bid, t.bid_sz, t.ask, t.ask_sz);
+    if (eng_) at(now_ + ns(cfg_.md_lat_s), [this, i, t]() mutable { t.ts = now_; eng_->on_book(i, t); });
   }
 
   void rfq(InstrumentId i) {
@@ -333,6 +343,7 @@ class Sim final : public Venue {
       best = cs == Side::Buy ? std::min(best, q) : std::max(best, q);
     }
     ++res_.rfq;
+    if (!eng_) return;
     const auto ours = eng_->on_rfq(i, cs, qty, now_);
     if (!ours) return;
     const bool better = cs == Side::Buy ? *ours < best : *ours > best;

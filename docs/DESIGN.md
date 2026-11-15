@@ -27,10 +27,11 @@ well-built single-instrument quoter:
 **In scope (implemented).** Quoting logic for order-book and RFQ markets, the
 factor model and pricers, online calibration, portfolio risk, hedging, limits
 and kill switch, a deterministic event-driven simulator with a matching engine,
-tests, and a latency benchmark.
+a paper-trading path on real market data (venue adapters, recorder, replay,
+calibration, file-based configuration), tests, and a latency benchmark.
 
-**Out of scope (not implemented).** Exchange and venue connectivity (FIX, ITCH,
-OUCH, crypto websockets), multi-level order ladders and queue-position
+**Out of scope (not implemented).** Sending real orders to any venue, low-latency
+feeds (FIX, ITCH, OUCH, websockets; the shipped adapters poll REST), multi-level order ladders and queue-position
 modelling, persistence and recovery, regulatory reporting and best-execution
 records, a real volatility surface (SVI/SABR, dividends, rates, American
 exercise), FPGA or kernel-bypass I/O, and calibration to historical data. These
@@ -79,6 +80,7 @@ Files, all under `include/amm/`:
 | `sim/matching.hpp` | Price-time priority order book |
 | `sim/sim.hpp` | Market simulator |
 | `sim/scenario.hpp` | Reference 12-instrument universe and the comparison modes |
+| `live/*.hpp` | Event format, config loader, paper venue, runner, calibration (section 11) |
 
 The library is header-only C++20 with no dependencies.
 
@@ -357,16 +359,99 @@ Reading the table:
 - No fees, financing, funding payments on the perp, capital charges or
   dividends.
 
-## 11. Roadmap
+## 11. Live path: paper trading on real market data
+
+The engine is connected to real markets through one seam, a normalised event
+stream, so that venues, recording, replay and calibration are all independent
+of each other and of the engine.
+
+```
+ venue adapter (one per venue,       normalised events (CSV lines)
+ any language, own process)   --->   B top of book / T trade / C composite
+ feeds/binance.py, coinbase.py                |
+                                              v
+                    +-------------------- amm_run ---------------------+
+  --record FILE <-- | journal    Runner: warm-up, timers, accounting   |
+                    |               |                     ^            |
+  --replay FILE --> | same code     v                     | fills      |
+                    |            Engine --- orders ---> PaperVenue     |
+                    +--------------------------------------------------+
+                                              |
+        amm_calibrate FILE  <--- journal -----+---> config/*.ini (vol, A0, k0, corr)
+```
+
+| Piece | File | What it does |
+|---|---|---|
+| Event format | `live/events.hpp` | Three line types; parse and format round-trip exactly |
+| Configuration | `live/config.hpp`, `config/*.ini` | Factors, correlations, instruments, pricers and engine parameters from a file; errors carry file and line |
+| Paper venue | `live/paper.hpp` | Matches our orders locally against the real book and prints |
+| Runner | `live/runner.hpp`, `apps/amm_run.cpp` | Reads events from a pipe or a file, drives engine and venue, records, reports |
+| Calibration | `live/calibrate.hpp`, `apps/amm_calibrate.cpp` | Volatility, jumps, correlation, spreads and fill curve from a journal |
+| Adapters | `feeds/*.py` | Binance spot and perpetuals, Coinbase; standard library only |
+| Sample data | `apps/amm_record_sim.cpp`, `feeds/synthetic.py` | Journals and a live-style stream with no network |
+
+**Why adapters are separate processes.** A venue adapter only has to print
+lines. It can be written in any language, restarted without touching the
+engine, and replaced by a file. Adding a venue is one small file (see the
+docstring in `feeds/common.py`); adding an asset class to it is a config
+section. The shipped adapters poll REST endpoints, which is simple and has no
+dependencies but is limited to roughly one update per half second per symbol.
+That is adequate for paper trading and calibration and not for anything
+latency-sensitive; a websocket or native C++ feed handler writes the same
+lines.
+
+**Paper venue rules.** Orders and cancels take effect one configured latency
+after they are sent. A trade printing through our price fills us; a trade at
+our price fills us only after the size displayed ahead of us when we joined
+has traded; joining inside the spread puts nobody ahead. If the market quote
+crosses our resting price we fill once against the displayed size. IOC and
+marketable orders take the displayed size at the touch and no more. No order
+leaves the process: there is no order API in the codebase.
+
+**What paper trading cannot measure.** Flow that would have traded with our
+better price but never printed, because nobody was quoting there, is
+invisible. Adverse fills (the market running over a stale quote) are all
+visible. Paper P&L on recorded data is therefore biased downward for a quoter
+that sits inside the spread. Replaying the simulator's own journal shows the
+size of this: the same engine that earns in the full simulator loses on the
+replay, because the journal contains every sniper print but only the small
+share of benign takers who were willing to pay the background spread. Treat
+paper results as a check on behaviour, risk and adverse selection, not as an
+estimate of spread capture.
+
+**Warm-up.** The runner starts the engine only when every order-book
+instrument has a market, and feeds factor reference markets first, so factor
+levels come from the market and never from the rough values in the config.
+
+**Calibration.** Volatility is a robust (median-based) estimate from one-second
+mid changes, with moves beyond five robust sigmas reported separately as
+jumps. The fill curve is measured the way a resting quote experiences it: a
+hypothetical quote is placed at each distance from the prevailing mid and
+counted as filled when a trade prints at or through it within the horizon.
+Public prints identify the curve at and beyond the touch only; inside the
+spread it is an extrapolation that the engine's online estimator then corrects
+from its own fills.
+
+**Verified and not verified.** Tests cover the event format, both config
+files, the paper venue's fill rules, replay determinism (a session recorded
+live replays to the identical result), warm-up, and calibration against a tape
+with known parameters. The adapters' parsers are tested against payloads
+shaped like the venues' documented responses. The adapters have not been run
+against the real endpoints: the build environment has no route to any
+exchange. Expect to fix small things on first contact (rate limits, a regional
+base URL, a field name).
+
+## 12. Roadmap
 
 Ordered by what blocks real use first.
 
-1. Market-data and order gateways behind `Venue` (start with one equity venue
-   and one crypto venue), with own-order filtering of the book, order
-   acknowledgements, rejects and throttles.
-2. Event journal and replay; state snapshot and recovery.
-3. Calibration and backtest on recorded data: replace the simulator's assumed
-   fill curve and jump process with measured ones.
+1. Run the adapters against the real venues and fix what first contact
+   shows; then a websocket (or native) feed for sub-second data.
+2. Calibrate on recorded sessions and replace the placeholder numbers in
+   `config/crypto.ini`.
+3. A real order gateway behind `Venue` (testnet first), with acknowledgements,
+   rejects, throttles and own-order filtering of the book; state snapshot and
+   recovery.
 4. Multi-level ladders, queue-position model, and requote hysteresis tuned to
    venue fee schedules.
 5. Volatility surface (SVI per expiry, vega buckets as separate factors),

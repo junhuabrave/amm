@@ -6,9 +6,10 @@ from one codebase, one fair-value model and one risk book. Header-only C++20,
 no dependencies, with a deterministic multi-asset simulator, tests and a
 latency benchmark.
 
-**Status: research-grade core.** The quoting, risk and hedging logic is
-implemented and tested in simulation. There is no exchange connectivity,
-persistence or regulatory tooling, so it cannot trade a live market as is.
+**Status: research-grade core with a paper-trading path.** The quoting, risk
+and hedging logic is implemented and tested in simulation, and can be run
+against real public market data with orders matched locally. It never sends an
+order to a venue: there is no order API, persistence or regulatory tooling.
 See [docs/DESIGN.md](docs/DESIGN.md) for scope, design and roadmap, and
 [docs/RESEARCH.md](docs/RESEARCH.md) for sources.
 
@@ -29,13 +30,44 @@ See [docs/DESIGN.md](docs/DESIGN.md) for scope, design and roadmap, and
 
 ```sh
 cmake -S . -B build && cmake --build build     # or: ./build.sh  (g++ >= 11 only)
-./build/amm_tests                              # 27 tests
+./build/amm_tests                              # 36 tests
+python3 feeds/test_feeds.py                    # adapter tests, offline
 ./build/amm_sim --seeds 24 --duration 1800 --detail
 ./build/amm_bench
 ```
 
 `amm_sim` options: `--seeds N`, `--duration SECONDS`, `--gamma G`,
 `--csv FILE` (per-second P&L paths), `--detail` (per-instrument breakdown).
+
+## Paper trading on real market data
+
+```sh
+# live: a venue adapter pipes normalised events into the runner
+python3 feeds/binance.py BTCUSDT ETHUSDT --perp BTCUSDT \
+  | ./build/amm_run --config config/crypto.ini --record data/session.csv
+
+# replay the recorded session (identical result), then calibrate from it
+./build/amm_run --config config/crypto.ini --replay data/session.csv
+./build/amm_calibrate data/session.csv
+
+# no network: try the same pipe on a synthetic stream, or on a simulator journal
+python3 feeds/synthetic.py --seconds 600 | ./build/amm_run --config config/crypto.ini
+./build/amm_record_sim --out data/sim.csv && ./build/amm_run --config config/sim.ini --replay data/sim.csv
+```
+
+- Orders are matched in-process against the real book and trade prints, with
+  latency and queue position. Nothing is sent to the venue except GET requests
+  for public data.
+- Instruments, factors, pricers and engine parameters live in `config/*.ini`.
+  The numbers in `config/crypto.ini` are placeholders: record an hour, run
+  `amm_calibrate`, and replace them.
+- A new venue is one small adapter that prints three kinds of line
+  (`feeds/common.py` explains how).
+- The adapters are tested offline against documented payload shapes. They have
+  not yet been run against the real endpoints, which were unreachable from the
+  build environment.
+- Paper P&L understates spread capture (flow that never printed is invisible)
+  and shows adverse selection in full. See [DESIGN.md §11](docs/DESIGN.md).
 
 ## Simulation results
 
@@ -73,7 +105,11 @@ for an underlying tick that requotes six instruments.
 ```
 include/amm/          engine library (core, factor, pricing, signals, quoter, linalg, engine)
 include/amm/sim/      matching engine, market simulator, reference scenario
-apps/                 amm_sim (comparison), amm_bench (latency)
+include/amm/live/     event format, config loader, paper venue, runner, calibration
+apps/                 amm_sim (comparison), amm_bench (latency), amm_run (paper trading),
+                      amm_calibrate, amm_record_sim
+feeds/                venue adapters (Binance, Coinbase, synthetic) and their tests
+config/               sim.ini (reference universe), crypto.ini (starter live universe)
 tests/                unit and end-to-end tests
 docs/                 DESIGN.md, RESEARCH.md
 ```

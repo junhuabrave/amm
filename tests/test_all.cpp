@@ -5,10 +5,19 @@
 #include <string>
 #include <vector>
 
+#include <sstream>
+
+#include "amm/live/calibrate.hpp"
+#include "amm/live/runner.hpp"
 #include "amm/sim/scenario.hpp"
 
 using namespace amm;
 using namespace amm::sim;
+using namespace amm::live;
+
+#ifndef AMM_SOURCE_DIR
+#define AMM_SOURCE_DIR "."
+#endif
 
 static int g_fail = 0, g_checks = 0;
 #define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL %s:%d  %s\n", __FILE__, __LINE__, #c); } } while (0)
@@ -481,6 +490,249 @@ TEST(unified_avoids_derivative_sniping) {
     }
   }
   CHECK(su < 0.75 * ss);
+}
+
+// ---- live path: events, config, paper venue, runner, calibration ----------------
+
+TEST(event_lines_round_trip) {
+  MdEvent e;
+  CHECK(parse_event("1700000000123456789,B,BINANCE:BTCUSDT,60000.1,0.431,60000.2,0.12", e));
+  CHECK(e.ts == 1700000000123456789LL && e.type == 'B' && e.sym == "BINANCE:BTCUSDT");
+  NEAR(e.a, 60000.1, 1e-9); NEAR(e.b, 0.431, 1e-12); NEAR(e.c, 60000.2, 1e-9); NEAR(e.d, 0.12, 1e-12);
+  MdEvent r;
+  CHECK(parse_event(format_event(e), r) && r.ts == e.ts && r.a == e.a && r.d == e.d && r.sym == e.sym);
+  CHECK(parse_event("5,T,ACME C100 3M,5.93,10,S\r", e) && e.type == 'T' && e.c == -1.0 && e.sym == "ACME C100 3M");
+  CHECK(parse_event(format_event(e), r) && r.c == -1.0 && r.b == 10.0);
+  CHECK(parse_event("7,C,BOND,99.5", e) && e.type == 'C' && e.a == 99.5);
+  for (const char* bad : {"", "# comment", "x,B,S,1,1,2,1", "5,B,S,1,1,2", "5,T,S,1,1", "5,Q,S,1", "5,B,,1,1,2,1", "5,B,S,a,1,2,1"})
+    CHECK(!parse_event(bad, e));
+}
+
+TEST(config_file_reproduces_the_reference_universe) {
+  const LiveConfig cfg = load_config(std::string(AMM_SOURCE_DIR) + "/config/sim.ini");
+  RecVenue v1, v2;
+  Engine a(cfg.engine, &v1), b(mode_config(Mode::Unified), &v2);
+  amm::live::build_engine(cfg, a);
+  const Universe u = default_universe();
+  amm::sim::build_engine(u, b);
+  a.start(0); b.start(0);
+  CHECK(a.instruments() == b.instruments());
+  for (size_t i = 0; i < b.instruments(); ++i) {
+    const Instrument& x = a.instrument(i);
+    const Instrument& y = b.instrument(i);
+    CHECK(x.symbol == y.symbol && x.cls == y.cls && x.proto == y.proto);
+    CHECK(x.tick == y.tick && x.lot == y.lot && x.mult == y.mult && x.quote_size == y.quote_size);
+    CHECK(x.max_pos == y.max_pos && x.max_spread == y.max_spread && x.idio_vol == y.idio_vol);
+    NEAR(x.A0, y.A0, 1e-9); NEAR(x.k0, y.k0, 1e-9);
+    CHECK(x.rfq_a0 == y.rfq_a0 && x.rfq_b0 == y.rfq_b0 && x.ref_gain == y.ref_gain);
+    CHECK(x.ref_for_factor == y.ref_for_factor && x.hedges_factor == y.hedges_factor);
+    NEAR(a.fair(i), b.fair(i), 1e-9);
+    NEAR(a.sigma(i), b.sigma(i), 1e-12);
+  }
+  CHECK(load_config(std::string(AMM_SOURCE_DIR) + "/config/crypto.ini").instruments.size() == 3);
+}
+
+TEST(config_errors_are_reported_with_location) {
+  auto fails = [](const std::string& text, const std::string& needle) {
+    try {
+      std::istringstream is(text);
+      const LiveConfig c = parse_config(is, "t.ini");
+      RecVenue v;
+      Engine e(c.engine, &v);
+      amm::live::build_engine(c, e);
+    } catch (const std::exception& ex) {
+      return std::string(ex.what()).find(needle) != std::string::npos;
+    }
+    return false;
+  };
+  const std::string f = "[factor F]\nlevel = 1\nvol = 0.1\n";
+  const std::string i = "[instrument X]\ntick=0.01\nlot=1\nmult=1\nquote_size=1\nmax_pos=10\n";
+  CHECK(fails(f + "[engine]\ngama = 1\n", "t.ini:5"));
+  CHECK(fails(f + "[engine]\ngamma = abc\n", "not a number"));
+  CHECK(fails(f + i, "pricer"));
+  CHECK(fails(f + i + "pricer = linear G\n", "unknown factor 'G'"));
+  CHECK(fails(f + i + "pricer = linear F\nhedges = Z\n", "unknown factor 'Z'"));
+  CHECK(fails(f + "[instrument X]\npricer = linear F\ntick = 0\n", "must all be > 0"));
+  CHECK(fails(i, "no [factor]"));
+  CHECK(!fails(f + i + "pricer = linear F ; trailing comment\n", ""));
+}
+
+struct PaperFix {
+  PaperVenue v{0.001};
+  std::vector<Fill> fills;
+  PaperFix() {
+    v.resize(1);
+    v.set_fill_handler([this](const Fill& f) { fills.push_back(f); });
+    v.on_time(0);
+    v.on_book(0, TopOfBook{99.0, 101.0, 50, 60, 0});
+  }
+  double filled() const { double q = 0; for (const auto& f : fills) q += f.qty; return q; }
+};
+
+TEST(paper_orders_wait_for_latency_and_cancels_race) {
+  PaperFix p;
+  const OrderId id = p.v.submit(0, Side::Buy, 100.0, 10, false, false);
+  p.v.on_trade(0, 99.5, 10, -1);  // prints through our price, but we are not live yet
+  CHECK(p.fills.empty());
+  p.v.on_time(ns(0.001));
+  CHECK(p.v.resting(0) == 1);
+  p.v.cancel(0, id);
+  p.v.on_trade(0, 99.5, 4, -1);   // cancel still in flight: we get filled
+  CHECK(p.fills.size() == 1 && p.fills[0].qty == 4 && p.fills[0].px == 100.0 && p.fills[0].side == Side::Buy);
+  p.v.on_time(ns(0.002));
+  CHECK(p.v.resting(0) == 0);
+  p.v.on_trade(0, 99.5, 10, -1);
+  CHECK(p.fills.size() == 1);
+}
+
+TEST(paper_queue_position_at_the_touch) {
+  PaperFix p;
+  p.v.submit(0, Side::Buy, 99.0, 10, false, false);   // joins the 50 already bid at 99
+  p.v.submit(0, Side::Sell, 100.5, 10, false, false); // improves the offer: nobody ahead
+  p.v.on_time(ns(0.001));
+  p.v.on_trade(0, 99.0, 30, -1);
+  CHECK(p.fills.empty());            // 30 of the 50 ahead of us traded
+  p.v.on_trade(0, 99.0, 25, -1);     // 20 more ahead, then 5 for us
+  CHECK(p.fills.size() == 1 && p.fills[0].qty == 5);
+  p.v.on_trade(0, 98.9, 100, -1);    // trades through: the rest fills, at our price
+  CHECK(p.filled() == 10 && p.fills.back().px == 99.0);
+  p.v.on_trade(0, 100.5, 3, +1);     // at our improving offer: immediate
+  CHECK(p.fills.back().side == Side::Sell && p.fills.back().qty == 3);
+  p.v.on_trade(0, 100.4, 5, +1);     // a buyer who paid less than our offer does not fill us
+  CHECK(p.filled() == 13);
+  p.v.on_trade(0, 99.0, 5, -1);      // wrong side for the offer, and the bid is gone
+  CHECK(p.filled() == 13);
+}
+
+TEST(paper_crossing_quotes_and_ioc) {
+  PaperFix p;
+  p.v.submit(0, Side::Buy, 100.0, 10, false, false);
+  p.v.on_time(ns(0.001));
+  p.v.on_book(0, TopOfBook{99.0, 100.0, 50, 4, ns(0.002)});  // an offer arrives at our bid
+  CHECK(p.fills.size() == 1 && p.fills[0].qty == 4 && p.fills[0].px == 100.0);
+  p.v.on_book(0, TopOfBook{99.0, 100.0, 50, 4, ns(0.003)});  // same quote again: no double count
+  CHECK(p.fills.size() == 1);
+  p.v.on_book(0, TopOfBook{99.0, 99.9, 50, 100, ns(0.004)}); // a new, deeper crossing
+  CHECK(p.filled() == 10 && p.v.resting(0) == 0);
+  // IOC takes the displayed size at the market's price and never rests.
+  p.v.submit(0, Side::Buy, 100.2, 500, true, true);
+  p.v.on_time(ns(0.01));
+  CHECK(p.fills.back().qty == 100 && p.fills.back().px == 99.9 && p.fills.back().hedge);
+  CHECK((p.fills.back().oid & kHedgeTag) != 0 && p.v.resting(0) == 0);
+  p.v.submit(0, Side::Sell, 99.5, 5, true, false);  // not marketable against a 99.0 bid
+  p.v.on_time(ns(0.02));
+  CHECK(p.filled() == 110);
+}
+
+static std::string sim_journal(uint64_t seed, double secs_) {
+  const Universe u = default_universe();
+  SimConfig sc;
+  sc.seed = seed; sc.duration_s = secs_;
+  Sim sim(u, sc);
+  std::ostringstream os;
+  sim.tap = [&](TimeNs ts, char type, InstrumentId i, double a, double b, double c, double d) {
+    MdEvent ev;
+    ev.ts = ts + 1; ev.type = type; ev.sym = u.insts[i].in.symbol; ev.a = a; ev.b = b; ev.c = c; ev.d = d;
+    os << format_event(ev) << '\n';
+  };
+  sim.run();
+  return os.str();
+}
+
+TEST(runner_replays_a_journal_deterministically) {
+  const std::string journal = sim_journal(9, 120);
+  CHECK(journal.size() > 100000);
+  const LiveConfig cfg = load_config(std::string(AMM_SOURCE_DIR) + "/config/sim.ini");
+  double pnl[2]; uint64_t fills[2];
+  std::string recorded;
+  for (int k = 0; k < 2; ++k) {
+    std::istringstream in(journal);
+    std::ostringstream rec;
+    RunnerOptions opt;
+    opt.record = k == 0 ? &rec : nullptr;
+    Runner r(cfg, opt);
+    r.run(in);
+    pnl[k] = r.pnl(); fills[k] = r.fills();
+    if (k == 0) recorded = rec.str();
+    CHECK(r.warm() && r.fills() > 50);
+    NEAR(r.elapsed_s(), 120.0, 0.5);
+    // The runner's account of fills and the engine's own book must agree on positions.
+    for (size_t i = 0; i < r.engine().instruments(); ++i) NEAR(r.position(i), r.engine().position(i), 1e-9);
+    NEAR(r.engine().pnl(), r.pnl(), 0.1 * std::fabs(r.pnl()) + 2000.0);
+    std::ostringstream sum;
+    r.summary(sum);
+    CHECK(sum.str().find("paper P&L") != std::string::npos);
+  }
+  CHECK(pnl[0] == pnl[1] && fills[0] == fills[1]);
+  // A journal recorded during a run replays to the same result.
+  std::istringstream again(recorded);
+  Runner r2(cfg, RunnerOptions{});
+  r2.run(again);
+  CHECK(r2.pnl() == pnl[0] && r2.fills() == fills[0]);
+}
+
+TEST(runner_waits_for_every_market_before_quoting) {
+  const LiveConfig cfg = load_config(std::string(AMM_SOURCE_DIR) + "/config/crypto.ini");
+  Runner r(cfg, RunnerOptions{});
+  auto book = [&](const char* sym, double bid, double ask, TimeNs ts) {
+    MdEvent e; e.ts = ts; e.type = 'B'; e.sym = sym; e.a = bid; e.b = 1.0; e.c = ask; e.d = 1.0;
+    r.on_event(e);
+  };
+  book("BINANCE:BTCUSDT", 97000.00, 97000.50, ns(1.0));
+  book("BINANCE:ETHUSDT", 3500.00, 3500.10, ns(1.1));
+  book("SOMETHING:ELSE", 1, 2, ns(1.15));
+  CHECK(!r.warm() && r.venue().orders_sent() == 0);
+  std::ostringstream early;
+  r.summary(early);
+  CHECK(early.str().find("BTC-USDT-PERP") != std::string::npos);  // says what it is waiting for
+  book("BINANCE-PERP:BTCUSDT", 97030.0, 97030.5, ns(1.2));
+  CHECK(r.warm());
+  // Factor levels come from the market, not from the config's rough guess.
+  NEAR(r.engine().factors().level(0), 97000.25, 0.5);
+  NEAR(r.engine().fair(2), 97030.25, 0.5);  // perp = spot + learned basis
+  CHECK(r.venue().orders_sent() >= 6);
+  // Spot moves; the perp is repriced with it before its own book changes.
+  book("BINANCE:BTCUSDT", 97100.00, 97100.50, ns(1.3));
+  NEAR(r.engine().fair(2), 97130.25, 1.0);
+}
+
+TEST(calibration_recovers_volatility_and_fill_curve) {
+  // Synthetic tape with known parameters: a random-walk mid, and trades that
+  // print at exponentially distributed depths from it.
+  std::mt19937_64 rng(4);
+  std::normal_distribution<double> N;
+  std::uniform_real_distribution<double> U(0.0, 1.0);
+  const double vol = 0.02, A = 1.5, k = 40.0, dt = 0.05;
+  std::ostringstream os;
+  double mid = 100.0, mid2 = 50.0;
+  for (int i = 0; i < 12000 * 2; ++i) {
+    const TimeNs ts = ns(i * dt) + 1;
+    const double z = N(rng);
+    mid += vol * std::sqrt(dt) * z;
+    mid2 += 0.5 * vol * std::sqrt(dt) * (0.6 * z + 0.8 * N(rng));
+    MdEvent b; b.ts = ts; b.type = 'B';
+    b.sym = "X"; b.a = mid - 0.01; b.b = 5; b.c = mid + 0.01; b.d = 5; os << format_event(b) << '\n';
+    b.sym = "Y"; b.a = mid2 - 0.01; b.c = mid2 + 0.01; os << format_event(b) << '\n';
+    for (double side : {-1.0, 1.0})
+      if (U(rng) < A * dt) {
+        MdEvent t; t.ts = ts; t.type = 'T'; t.sym = "X"; t.b = 1; t.c = side;
+        t.a = mid + side * (-std::log(1.0 - U(rng)) / k);
+        os << format_event(t) << '\n';
+      }
+  }
+  std::istringstream in(os.str());
+  CalibrationOptions opt;
+  opt.horizon_s = 2.0;  // short, so drift of the mid does not blur the depths
+  const Calibration c = calibrate(in, opt);
+  CHECK(c.symbols.size() == 2 && c.symbols[0].sym == "X");
+  const SymbolCalibration& x = c.symbols[0];
+  NEAR(x.vol, vol, 0.15 * vol);
+  NEAR(x.mean_spread, 0.02, 1e-6);
+  NEAR(x.trade_rate, A, 0.15 * A);
+  NEAR(x.k, k, 0.3 * k);
+  NEAR(x.A, A, 0.35 * A);
+  NEAR(c.corr[1], 0.6, 0.1);
+  CHECK(c.symbols[1].A == 0.0);  // no trades on Y: reported as not identifiable
 }
 
 int main(int argc, char** argv) {
