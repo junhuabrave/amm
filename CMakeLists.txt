@@ -1,0 +1,22 @@
+cmake_minimum_required(VERSION 3.16)
+project(amm LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
+add_library(amm INTERFACE)
+target_include_directories(amm INTERFACE include)
+target_compile_options(amm INTERFACE -Wall -Wextra -Wpedantic)
+
+add_executable(amm_sim apps/amm_sim.cpp)
+target_link_libraries(amm_sim PRIVATE amm)
+add_executable(amm_bench apps/amm_bench.cpp)
+target_link_libraries(amm_bench PRIVATE amm)
+
+enable_testing()
+add_executable(amm_tests tests/test_all.cpp)
+target_link_libraries(amm_tests PRIVATE amm)
+add_test(NAME amm_tests COMMAND amm_tests)
