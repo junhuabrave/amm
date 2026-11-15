@@ -63,9 +63,9 @@ python3 feeds/synthetic.py --seconds 600 | ./build/amm_run --config config/crypt
   `amm_calibrate`, and replace them.
 - A new venue is one small adapter that prints three kinds of line
   (`feeds/common.py` explains how).
-- The adapters are tested offline against documented payload shapes. They have
-  not yet been run against the real endpoints, which were unreachable from the
-  build environment.
+- The adapters' parsers are tested against responses captured from the live
+  Binance and Coinbase endpoints. A continuous live session has not been run
+  yet from the build environment, which cannot reach the exchanges.
 - Paper P&L understates spread capture (flow that never printed is invisible)
   and shows adverse selection in full. See [DESIGN.md §11](docs/DESIGN.md).
 

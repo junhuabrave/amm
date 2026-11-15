@@ -435,11 +435,12 @@ from its own fills.
 **Verified and not verified.** Tests cover the event format, both config
 files, the paper venue's fill rules, replay determinism (a session recorded
 live replays to the identical result), warm-up, and calibration against a tape
-with known parameters. The adapters' parsers are tested against payloads
-shaped like the venues' documented responses. The adapters have not been run
-against the real endpoints: the build environment has no route to any
-exchange. Expect to fix small things on first contact (rate limits, a regional
-base URL, a field name).
+with known parameters. The adapters' parsers are tested against responses captured from the live
+Binance spot, Binance perpetual and Coinbase endpoints on 2026-11-15, and the
+resulting lines run through `amm_run`. What has not been done is a continuous
+live session: the build environment's shells have no route to any exchange,
+so the polling loop has only run against stand-ins. Rate limits and regional
+access are the things to watch on a first long run.
 
 ## 12. Roadmap
 

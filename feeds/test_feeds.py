@@ -46,6 +46,55 @@ class Parsers(unittest.TestCase):
         self.assertEqual(last, 86327327)
 
 
+# Responses captured from the live endpoints on 2026-11-15 (trimmed to a few rows).
+REAL_BINANCE_SPOT_DEPTH = {"lastUpdateId": 102929564974,
+    "bids": [["65439.05000000", "4.91823000"], ["65439.01000000", "0.00018000"]],
+    "asks": [["65439.06000000", "0.22579000"], ["65439.07000000", "0.00072000"]]}
+REAL_BINANCE_SPOT_TRADES = [
+    {"id": 6864031334, "price": "65460.01000000", "qty": "0.03819000", "quoteQty": "2499.91778190", "time": 1794749649016, "isBuyerMaker": False, "isBestMatch": True},
+    {"id": 6864031335, "price": "65460.01000000", "qty": "0.04962000", "quoteQty": "3248.12569620", "time": 1794749649016, "isBuyerMaker": False, "isBestMatch": True}]
+REAL_BINANCE_PERP_DEPTH = {"lastUpdateId": 12123019959927, "E": 1794749666232, "T": 1794749666228,
+    "bids": [["65460.50", "5.772"], ["65460.40", "0.032"]], "asks": [["65460.60", "0.162"], ["65460.70", "0.003"]]}
+REAL_BINANCE_PERP_TRADES = [
+    {"id": 8279844435, "price": "65429.50", "qty": "0.001", "quoteQty": "65.42", "time": 1794749682978, "isBuyerMaker": True, "isRPITrade": False},
+    {"id": 8279844436, "price": "65429.60", "qty": "0.137", "quoteQty": "8963.85", "time": 1794749683272, "isBuyerMaker": False, "isRPITrade": False}]
+REAL_COINBASE_BOOK = {"bids": [["65416.68", "0.02527264", 3]], "asks": [["65416.69", "0.07311991", 3]],
+    "sequence": 139485979677, "auction_mode": False, "auction": None, "time": "2026-11-15T13:35:17.914307550Z"}
+REAL_COINBASE_TRADES = [
+    {"trade_id": 1128610863, "side": "buy", "size": "0.00070487", "price": "65435.31000000", "time": "2026-11-15T13:35:31.288307Z"},
+    {"trade_id": 1128610861, "side": "sell", "size": "0.00068021", "price": "65435.32000000", "time": "2026-11-15T13:35:31.190746Z"}]
+
+
+class RealPayloads(unittest.TestCase):
+    def test_binance_spot(self):
+        self.assertEqual(binance.parse_depth(REAL_BINANCE_SPOT_DEPTH), (65439.05, 4.91823, 65439.06, 0.22579))
+        new, last = binance.parse_trades(REAL_BINANCE_SPOT_TRADES, 6864031333)
+        self.assertEqual(new, [(65460.01, 0.03819, "B"), (65460.01, 0.04962, "B")])
+        self.assertEqual(last, 6864031335)
+
+    def test_binance_perp(self):
+        self.assertEqual(binance.parse_depth(REAL_BINANCE_PERP_DEPTH), (65460.5, 5.772, 65460.6, 0.162))
+        new, _ = binance.parse_trades(REAL_BINANCE_PERP_TRADES, 0)
+        self.assertEqual(new, [(65429.5, 0.001, "S"), (65429.6, 0.137, "B")])
+
+    def test_coinbase(self):
+        self.assertEqual(coinbase.parse_book(REAL_COINBASE_BOOK), (65416.68, 0.02527264, 65416.69, 0.07311991))
+        new, last = coinbase.parse_trades(REAL_COINBASE_TRADES, 0)
+        # The up-tick (65435.32, maker "sell") was a buyer lifting the offer; the later print at 65435.31 hit the bid.
+        self.assertEqual(new, [(65435.32, 0.00068021, "B"), (65435.31, 0.00070487, "S")])
+        self.assertEqual(last, 1128610863)
+
+    def test_full_poll_produces_lines_the_runner_accepts(self):
+        def fetch(url):
+            return REAL_BINANCE_PERP_DEPTH if "/depth" in url else REAL_BINANCE_PERP_TRADES
+        s = binance.BinanceSource("BTCUSDT", perp=True, fetch=fetch)
+        s.poll()
+        s.last_id = 8279844435
+        lines = [common.line(1794749683500000000, ev[0], ev[1], *ev[2:]) for ev in s.poll()]
+        self.assertEqual(lines, ["1794749683500000000,T,BINANCE-PERP:BTCUSDT,65429.6,0.137,B",
+                                 "1794749683500000000,B,BINANCE-PERP:BTCUSDT,65460.5,5.772,65460.6,0.162"])
+
+
 class Plumbing(unittest.TestCase):
     def test_source_emits_trades_then_book(self):
         calls = []
