@@ -39,6 +39,7 @@ class Runner {
       by_feed_[cfg.instruments[i].feed] = static_cast<InstrumentId>(i);
     }
     paper_.set_fill_handler([this](const Fill& f) { on_fill(f); });
+    paper_.set_cancel_handler([this](InstrumentId i, OrderId o) { if (warm_) eng_.on_cancel_done(i, o); });
   }
 
   void run(std::istream& in) {
@@ -100,6 +101,7 @@ class Runner {
     return acct_[i].cash + (acct_[i].pos != 0.0 ? acct_[i].pos * eng_.instrument(i).mult * mark : 0.0);
   }
   double position(InstrumentId i) const { return acct_[i].pos; }
+  double peak_position(InstrumentId i) const { return acct_[i].peak; }  // largest |position| reached
   uint64_t fills() const { return fills_; }
   uint64_t events() const { return events_; }
   bool warm() const { return warm_; }
@@ -125,15 +127,16 @@ class Runner {
     const EngineStats& st = eng_.stats();
     os << "paper P&L " << std::setprecision(2) << pnl() << "   fills " << fills_ << " (hedges " << st.hedge_fills
        << ")   volume " << std::setprecision(0) << volume_ << "   orders " << paper_.orders_sent() << "   cancels "
-       << paper_.cancels_sent() << (eng_.halted() ? "   KILL SWITCH FIRED" : "") << "\n\n";
-    os << std::left << std::setw(22) << "instrument" << std::right << std::setw(12) << "position" << std::setw(8)
+       << paper_.cancels_sent() << std::setprecision(1) << " (" << paper_.orders_sent() / std::max(1e-9, elapsed_s())
+       << " orders/s)" << (eng_.halted() ? "   KILL SWITCH FIRED" : "") << "\n\n";
+    os << std::left << std::setw(22) << "instrument" << std::right << std::setw(12) << "position" << std::setw(12) << "peak |pos|" << std::setw(8)
        << "fills" << std::setw(14) << "P&L" << std::setw(14) << "mkt bid" << std::setw(14) << "mkt ask"
        << std::setw(14) << "our bid" << std::setw(14) << "our ask" << '\n';
     for (size_t i = 0; i < acct_.size(); ++i) {
       const InstrumentId id = static_cast<InstrumentId>(i);
       const Quote q = eng_.make_quote(id);
       os << std::left << std::setw(22) << eng_.instrument(id).symbol << std::right << std::setprecision(4)
-         << std::setw(12) << acct_[i].pos << std::setw(8) << acct_[i].fills << std::setprecision(2) << std::setw(14)
+         << std::setw(12) << acct_[i].pos << std::setw(12) << acct_[i].peak << std::setw(8) << acct_[i].fills << std::setprecision(2) << std::setw(14)
          << inst_pnl(id) << std::setprecision(6) << std::defaultfloat;
       auto px = [&](bool on, double v) { os << std::setw(14); if (on) os << v; else os << "-"; };
       px(tops_[i].valid(), tops_[i].bid); px(tops_[i].valid(), tops_[i].ask);
@@ -143,7 +146,7 @@ class Runner {
   }
 
  private:
-  struct Account { double pos = 0.0, cash = 0.0; uint64_t fills = 0; };
+  struct Account { double pos = 0.0, cash = 0.0, peak = 0.0; uint64_t fills = 0; };
 
   // The engine starts once every order-book instrument has a market, so no
   // instrument is ever priced off a configured (stale) factor level.
@@ -172,6 +175,7 @@ class Runner {
     Account& a = acct_[f.inst];
     const double mult = eng_.instrument(f.inst).mult;
     a.pos += sgn(f.side) * f.qty;
+    a.peak = std::max(a.peak, std::fabs(a.pos));
     a.cash -= sgn(f.side) * f.qty * f.px * mult;
     ++a.fills;
     ++fills_;

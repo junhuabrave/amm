@@ -30,7 +30,7 @@ See [docs/DESIGN.md](docs/DESIGN.md) for scope, design and roadmap, and
 
 ```sh
 cmake -S . -B build && cmake --build build     # or: ./build.sh  (g++ >= 11 only)
-./build/amm_tests                              # 36 tests
+./build/amm_tests                              # 39 tests
 python3 feeds/test_feeds.py                    # adapter tests, offline
 ./build/amm_sim --seeds 24 --duration 1800 --detail
 ./build/amm_bench
@@ -43,8 +43,11 @@ python3 feeds/test_feeds.py                    # adapter tests, offline
 
 ```sh
 # live: a venue adapter pipes normalised events into the runner
-python3 feeds/binance.py BTCUSDT ETHUSDT --perp BTCUSDT \
-  | ./build/amm_run --config config/crypto.ini --record data/session.csv
+python3 feeds/binance_ws.py --perp BTCUSDT ETHUSDT \
+  | ./build/amm_run --config config/binance_perp.ini --record data/session.csv
+
+# the REST polling adapter (about one update per second) still works the same way
+python3 feeds/binance.py BTCUSDT ETHUSDT --perp BTCUSDT | ./build/amm_run --config config/crypto.ini
 
 # replay the recorded session (identical result), then calibrate from it
 ./build/amm_run --config config/crypto.ini --replay data/session.csv
@@ -56,16 +59,22 @@ python3 feeds/synthetic.py --seconds 600 | ./build/amm_run --config config/crypt
 ```
 
 - Orders are matched in-process against the real book and trade prints, with
-  latency and queue position. Nothing is sent to the venue except GET requests
-  for public data.
+  latency and queue position. Nothing is sent to the venue except requests
+  for public data (REST GETs, websocket subscriptions).
+- `feeds/binance_ws.py` streams every top-of-book change and every aggregated
+  trade (Binance perps: about 2,000 book updates a second across BTC and ETH).
+  It uses a small standard-library websocket client (`feeds/ws.py`), reconnects
+  on drops and silences, and reports rate and exchange-to-receipt latency on
+  stderr. TLS is always verified; Python builds without a CA bundle fall back
+  to the system one (or `--cafile` / `$AMM_CAFILE`).
 - Instruments, factors, pricers and engine parameters live in `config/*.ini`.
   The numbers in `config/crypto.ini` are placeholders: record an hour, run
   `amm_calibrate`, and replace them.
 - A new venue is one small adapter that prints three kinds of line
   (`feeds/common.py` explains how).
-- The adapters' parsers are tested against responses captured from the live
-  Binance and Coinbase endpoints. A continuous live session has not been run
-  yet from the build environment, which cannot reach the exchanges.
+- The adapters' parsers are tested against responses and stream messages
+  captured from the live Binance and Coinbase endpoints, and live Binance
+  perpetual sessions have been recorded over both REST and websockets.
 - Paper P&L understates spread capture (flow that never printed is invisible)
   and shows adverse selection in full. See [DESIGN.md §11](docs/DESIGN.md).
 
@@ -77,19 +86,19 @@ sees the identical market per seed. 24 seeds x 1800 simulated seconds:
 
 | Mode | Mean P&L | St.dev across seeds | Sharpe (per run) | Max drawdown | RFQ hit ratio |
 |---|---:|---:|---:|---:|---:|
-| naive (fixed share of market spread) | 47,258 | 23,173 | 3.2 | 16,462 | 65.1% |
-| siloed (optimal single-instrument quoting) | 90,621 | 12,157 | 11.6 | 5,267 | 23.0% |
-| + cross-asset fair value | 116,936 | 9,812 | 15.1 | 2,968 | 24.3% |
-| + portfolio skew | 114,078 | 16,156 | 12.2 | 6,956 | 35.5% |
-| unified (both) | 163,319 | 10,670 | 18.4 | 2,631 | 37.1% |
+| naive (fixed share of market spread) | 43,908 | 19,124 | 3.3 | 14,482 | 65.1% |
+| siloed (optimal single-instrument quoting) | 90,999 | 10,894 | 11.8 | 3,968 | 23.2% |
+| + cross-asset fair value | 116,185 | 6,705 | 15.5 | 2,588 | 24.3% |
+| + portfolio skew | 113,576 | 16,577 | 12.2 | 6,147 | 35.5% |
+| unified (both) | 160,891 | 9,229 | 18.4 | 2,375 | 36.9% |
 
 The ordering holds at other risk aversions (12 seeds):
 
 | gamma | siloed | + fair | + skew | unified |
 |---|---:|---:|---:|---:|
-| 0.01 | 102,776 | 155,120 | 109,678 | 174,667 |
-| 0.05 | 87,200 | 115,934 | 109,760 | 163,623 |
-| 0.20 | 31,894 | 34,471 | 74,438 | 101,345 |
+| 0.01 | 102,386 | 151,176 | 103,780 | 170,629 |
+| 0.05 | 89,284 | 115,465 | 107,969 | 158,619 |
+| 0.20 | 29,141 | 32,936 | 74,483 | 97,653 |
 
 These numbers compare designs inside a simulator whose world is built from the
 same model family as the engine. They are not a forecast of live P&L and not a

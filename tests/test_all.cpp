@@ -696,6 +696,114 @@ TEST(runner_waits_for_every_market_before_quoting) {
   NEAR(r.engine().fair(2), 97130.25, 1.0);
 }
 
+// A stream like the websocket feed's: bursts of book updates sharing one
+// receipt timestamp that make the quote flicker, then the market jumps
+// through our resting price. Cancelled-but-in-flight orders can still fill,
+// so the engine must count them against the position limit.
+static std::string flicker_stream(int bursts) {
+  std::ostringstream os;
+  TimeNs t = ns(1000.0);
+  double mid = 65000.0;
+  uint64_t rng = 7;
+  auto u = [&] { rng = rng * 6364136223846793005ULL + 1442695040888963407ULL; return (rng >> 11) * (1.0 / 9007199254740992.0); };
+  auto bk = [&](const char* s, double m, double half) {
+    os << t << ",B," << s << ',' << m - half << ",1.5," << m + half << ",1.5\n";
+  };
+  bk("BINANCE-PERP:ETHUSDT", 1800.0, 0.005);
+  for (int b = 0; b < bursts; ++b) {
+    for (int k = 0; k < 15; ++k) { mid += (u() < 0.5 ? -0.3 : 0.3); bk("BINANCE-PERP:BTCUSDT", mid, 0.05); }
+    t += ns(0.09);  // the next read comes after the paper latency
+    const double jump = (b % 2 ? -1.0 : 1.0) * 40.0;
+    mid += jump;
+    bk("BINANCE-PERP:BTCUSDT", mid, 0.05);  // runs over every resting quote on one side
+    os << t << ",T,BINANCE-PERP:BTCUSDT," << mid << ",5," << (jump > 0 ? 'B' : 'S') << '\n';
+    t += ns(0.01);
+  }
+  return os.str();
+}
+
+TEST(runner_respects_position_limit_when_quotes_flicker) {
+  const LiveConfig cfg = load_config(std::string(AMM_SOURCE_DIR) + "/config/binance_perp.ini");
+  for (double life : {0.0, 0.25}) {
+    LiveConfig c = cfg;
+    c.engine.min_quote_life_s = life;
+    c.engine.hedge_band = 1e12;  // no hedger: the quotes alone must respect the limit
+    std::istringstream in(flicker_stream(40));
+    Runner r(c, RunnerOptions{});
+    r.run(in);
+    CHECK(r.warm() && r.fills() > 10);
+    for (size_t i = 0; i < r.engine().instruments(); ++i)
+      CHECK(r.peak_position(i) <= r.engine().instrument(i).max_pos + 1e-9);
+  }
+}
+
+TEST(cancelled_orders_count_against_the_limit_until_confirmed) {
+  EngineConfig c = mode_config(Mode::Unified);
+  c.hedge_band = 1e12; c.risk_limit = 1e12;
+  Full f(c);
+  const InstrumentId s = f.id.stock;
+  const double max_pos = f.u.insts[s].in.max_pos, size = f.u.insts[s].in.quote_size;
+  // Worst case if everything still able to fill on the bid side does fill.
+  auto worst = [&] {
+    const Rec* b = f.v.live(s, Side::Buy);
+    return f.e.position(s) + f.e.closing(s, Side::Buy) + (b ? b->qty : 0.0);
+  };
+  const Rec* first = f.v.live(s, Side::Buy);
+  CHECK(first != nullptr && first->qty == size);
+  const OrderId old = first ? first->id : 0;
+  f.e.on_fill(Fill{s, Side::Buy, f.e.fair(s), max_pos - size, f.ts += 1000, 0, false});
+  CHECK(worst() <= max_pos + 1e-9);
+  const double fv = f.e.fair(s);
+  // Market drops (and the inventory skew moved it already): the bid is
+  // cancelled. Until the venue confirms, it may still fill, so no
+  // replacement is placed.
+  f.e.on_book(s, book(fv - 1.0, f.u.insts[s].bg_half, f.u.insts[s].in.tick, f.ts += 1000));
+  CHECK(f.v.live(s, Side::Buy) == nullptr);
+  NEAR(f.e.closing(s, Side::Buy), size, 1e-9);
+  CHECK(f.v.live(s, Side::Buy) == nullptr);
+  CHECK(worst() <= max_pos + 1e-9);
+  f.e.on_fill(Fill{s, Side::Buy, fv, 0.4 * size, f.ts += 1000, old, false});  // it did fill, in part
+  NEAR(f.e.closing(s, Side::Buy), 0.6 * size, 1e-9);
+  CHECK(worst() <= max_pos + 1e-9);
+  f.e.on_cancel_done(s, old);               // venue confirms: the rest can no longer fill
+  NEAR(f.e.closing(s, Side::Buy), 0.0, 1e-9);
+  const Rec* nb = f.v.live(s, Side::Buy);
+  CHECK(nb && nb->id != old);               // room is back, and used
+  CHECK(worst() <= max_pos + 1e-9);
+  f.e.on_cancel_done(s, old);               // a duplicate confirmation changes nothing
+  NEAR(f.e.closing(s, Side::Buy), 0.0, 1e-9);
+}
+
+TEST(young_quotes_are_kept_unless_they_must_go) {
+  EngineConfig c = mode_config(Mode::Unified);
+  c.hedge_band = 1e12; c.risk_limit = 1e12; c.min_quote_life_s = 1.0;
+  Full f(c);
+  const InstrumentId s = f.id.stock;
+  const double tick = f.u.insts[s].in.tick, half = f.u.insts[s].bg_half;
+  f.ts += ns(2.0);
+  const double fv = f.e.fair(s);
+  f.e.on_book(s, book(fv + 0.5 * tick, half, tick, f.ts += 1000));  // fresh quotes, now young
+  const size_t n0 = f.v.orders.size();
+  // Market ticks up: our quotes would only become more aggressive. Young: wait.
+  for (int k = 1; k <= 3; ++k) f.e.on_book(s, book(fv + (0.5 + k) * tick, half, tick, f.ts += 1000));
+  const Rec* bid = f.v.live(s, Side::Buy);
+  size_t bids = 0, asks = 0;
+  for (size_t k = n0; k < f.v.orders.size(); ++k)
+    if (f.v.orders[k].inst == s) (f.v.orders[k].side == Side::Buy ? bids : asks)++;
+  CHECK(bid != nullptr && bids == 0);       // the bid waited
+  CHECK(asks > 0);                          // the ask, now too low, did not
+  // Market drops: our bid is now above where we want it. Replace at once.
+  f.e.on_book(s, book(fv - 20 * tick, half, tick, f.ts += 1000));
+  const Rec* nb = f.v.live(s, Side::Buy);
+  CHECK(nb && bid && nb->id != bid->id && nb->px < bid->px);
+  // Once old enough, small moves are followed again.
+  f.ts += ns(1.5);
+  const OrderId before = f.v.live(s, Side::Buy) ? f.v.live(s, Side::Buy)->id : 0;
+  f.e.on_book(s, book(fv - 17 * tick, half, tick, f.ts += 1000));
+  const Rec* later = f.v.live(s, Side::Buy);
+  CHECK(later && later->id != before);
+}
+
 TEST(calibration_recovers_volatility_and_fill_curve) {
   // Synthetic tape with known parameters: a random-walk mid, and trades that
   // print at exponentially distributed depths from it.

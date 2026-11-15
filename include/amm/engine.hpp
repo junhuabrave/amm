@@ -36,6 +36,7 @@ struct EngineConfig {
   double risk_limit = 400.0;      // portfolio st.dev (currency / sqrt s): beyond it only reduce
   double max_loss = 1e9;          // kill switch on mark-to-fair P&L
   int requote_ticks = 1;          // price change that forces a cancel/replace
+  double min_quote_life_s = 0.0;  // a younger quote is kept unless it must go (see reconcile)
   double secs_per_year = 252.0 * 6.5 * 3600.0;
 };
 
@@ -127,6 +128,26 @@ class Engine {
     s.dirty = true;
   }
 
+  // The venue confirms that a cancel took effect (or that the order was
+  // already gone). Until then a cancelled order can still fill, so its
+  // remaining size counts against the position limit.
+  void on_cancel_done(InstrumentId id, OrderId oid) {
+    for (size_t k = 0; k < closing_.size(); ++k)
+      if (closing_[k].id == oid) {
+        State& s = st_[closing_[k].inst];
+        (closing_[k].side == Side::Buy ? s.closing_bid : s.closing_ask) -= closing_[k].qty;
+        closing_[k] = closing_.back();
+        closing_.pop_back();
+        st_[id].dirty = true;
+        flush();
+        return;
+      }
+  }
+  // Size of cancelled orders not yet confirmed gone, per side.
+  double closing(InstrumentId id, Side side) const {
+    return side == Side::Buy ? st_[id].closing_bid : st_[id].closing_ask;
+  }
+
   void on_fill(const Fill& f) {
     now_ = std::max(now_, f.ts);
     State& s = st_[f.inst];
@@ -145,6 +166,14 @@ class Engine {
     if (l.id == f.oid && f.oid != 0) {
       l.qty -= f.qty;
       if (l.qty < 0.5 * in.lot) l = Live{};
+    } else if (f.oid != 0) {
+      for (size_t k = 0; k < closing_.size(); ++k)
+        if (closing_[k].id == f.oid) {
+          const double q = std::min(f.qty, closing_[k].qty);
+          closing_[k].qty -= q;
+          (f.side == Side::Buy ? s.closing_bid : s.closing_ask) -= q;
+          break;
+        }
     }
     refresh_risk();
     for (auto& x : st_) x.dirty = true;  // inventory moved: every skew may change
@@ -276,8 +305,9 @@ class Engine {
       q.bid = floor_to(mid - 0.5 * in.max_spread, tick);
       q.ask = q.bid + floor_to(in.max_spread, tick);
     }
-    q.bid_sz = floor_to(std::min(in.quote_size, in.max_pos - s.pos), in.lot);
-    q.ask_sz = floor_to(std::min(in.quote_size, in.max_pos + s.pos), in.lot);
+    // Worst case: every cancelled order still in flight fills as well.
+    q.bid_sz = floor_to(std::min(in.quote_size, in.max_pos - s.pos - s.closing_bid), in.lot);
+    q.ask_sz = floor_to(std::min(in.quote_size, in.max_pos + s.pos - s.closing_ask), in.lot);
     q.bid_on = q.bid_sz >= in.lot && q.bid > 0;
     q.ask_on = q.ask_sz >= in.lot;
     if (risk_ > cfg_.risk_limit) {  // only show the side that reduces portfolio variance
@@ -296,7 +326,8 @@ class Engine {
   }
 
  private:
-  struct Live { OrderId id = 0; double px = 0.0, qty = 0.0; };
+  struct Live { OrderId id = 0; double px = 0.0, qty = 0.0; TimeNs ts = 0; };
+  struct Closing { OrderId id; InstrumentId inst; Side side; double qty; };
   struct State {
     TopOfBook top;
     MicroPrice micro;
@@ -309,6 +340,7 @@ class Engine {
     double m = 0.0;      // cov(price, portfolio value) per s
     double pos = 0.0;
     double hedge_pos = 0.0;  // part of pos acquired by the hedger
+    double closing_bid = 0.0, closing_ask = 0.0;  // cancelled, not yet confirmed gone
     double w_skew = 0.0;     // sqrt(gamma/2) * b' W E   (portfolio skew, price units)
     double w_self = 0.0;     // sqrt(gamma/2) * b' W b   (own-size risk per effective unit)
     Live bid, ask;
@@ -458,6 +490,12 @@ class Engine {
 
   void cancel_live(InstrumentId id, Live& l) {
     if (!l.id) return;
+    State& s = st_[id];
+    const Side side = &l == &s.bid ? Side::Buy : Side::Sell;
+    if (l.qty > 0) {
+      closing_.push_back(Closing{l.id, id, side, l.qty});
+      (side == Side::Buy ? s.closing_bid : s.closing_ask) += l.qty;
+    }
     venue_->cancel(id, l.id);
     ++stats_.cancels;
     l = Live{};
@@ -470,11 +508,19 @@ class Engine {
     if (l.id) {
       const bool moved = std::fabs(l.px - px) > (cfg_.requote_ticks - 0.5) * in.tick;
       const bool thin = l.qty < 0.5 * qty;  // keep queue position unless badly depleted
-      if (!on || moved || thin) cancel_live(id, l);
+      const bool too_big = l.qty > qty + 0.5 * in.lot;  // position room shrank
+      // Resting more aggressively than we now want: never wait to fix that.
+      const bool aggressive = side == Side::Buy ? l.px > px + 0.5 * in.tick : l.px < px - 0.5 * in.tick;
+      const bool young = now_ - l.ts < ns(cfg_.min_quote_life_s);
+      if (!on || too_big || aggressive || (!young && (moved || thin))) cancel_live(id, l);
     }
-    if (on && !l.id) {
+    // Room left once every order still able to fill (including one cancelled
+    // just above) is counted as filled.
+    const double room = side == Side::Buy ? in.max_pos - s.pos - s.closing_bid : in.max_pos + s.pos - s.closing_ask;
+    qty = floor_to(std::min(qty, room), in.lot);
+    if (on && !l.id && qty >= in.lot) {
       l.id = venue_->submit(id, side, px, qty, false, false);
-      l.px = px; l.qty = qty;
+      l.px = px; l.qty = qty; l.ts = now_;
       ++stats_.orders;
     }
   }
@@ -501,6 +547,7 @@ class Engine {
   std::vector<InstrumentId> hedge_inst_;
   std::vector<TimeNs> hedge_block_;
   std::vector<double> E_, SE_, WE_, W_;
+  std::vector<Closing> closing_;
   double cash_ = 0.0, risk_ = 0.0;
   TimeNs now_ = 0, t0_ = 0, last_timer_ = 0;
   bool halted_ = false;

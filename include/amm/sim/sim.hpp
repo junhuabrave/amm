@@ -171,7 +171,11 @@ class Sim final : public Venue {
     return id;
   }
   void cancel(InstrumentId i, OrderId id) override {
-    at(now_ + ns(cfg_.ord_lat_s), [=, this] { inst_[i].book.cancel(id); });
+    at(now_ + ns(cfg_.ord_lat_s), [=, this] {
+      inst_[i].book.cancel(id);
+      // Confirmation reaches the engine after market-data latency, behind any fill notice.
+      at(now_ + ns(cfg_.md_lat_s), [=, this] { eng_->on_cancel_done(i, id); });
+    });
   }
 
  private:

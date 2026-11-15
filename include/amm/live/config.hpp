@@ -117,6 +117,7 @@ inline LiveConfig parse_config(std::istream& is, const std::string& name = "conf
       else if (key == "risk_limit") e.risk_limit = num();
       else if (key == "max_loss") e.max_loss = num();
       else if (key == "requote_ticks") e.requote_ticks = static_cast<int>(num());
+      else if (key == "min_quote_life_ms") e.min_quote_life_s = num() * 1e-3;
       else if (key == "secs_per_year") e.secs_per_year = num();
       else throw std::runtime_error(where() + ": unknown [engine] key '" + key + "'");
     } else if (kind == "paper") {

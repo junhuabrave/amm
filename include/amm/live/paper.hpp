@@ -12,6 +12,10 @@
 //     the displayed size at that crossing.
 //   * IOC orders, and resting orders that are marketable on arrival, take
 //     the displayed size at the opposite touch and no more.
+//   * An order and its cancel sent at the same moment arrive in that order:
+//     a cancelled order that is marketable on arrival still fills, as it
+//     would on a real venue. Each processed cancel is confirmed back (the
+//     cancel handler), so the engine knows when the order can no longer fill.
 // What it cannot know: flow that would have traded with our better price but
 // never printed because nobody was quoting there. Paper results therefore
 // understate fills inside the spread.
@@ -30,6 +34,7 @@ class PaperVenue final : public Venue {
   explicit PaperVenue(double latency_s = 0.005) : latency_(ns(latency_s)) {}
   void resize(size_t instruments) { books_.assign(instruments, Book{}); }
   void set_fill_handler(std::function<void(const Fill&)> h) { on_fill_ = std::move(h); }
+  void set_cancel_handler(std::function<void(InstrumentId, OrderId)> h) { on_cancel_ = std::move(h); }
   uint64_t orders_sent() const { return sent_; }
   uint64_t cancels_sent() const { return cancels_; }
   size_t resting(InstrumentId i) const { return books_[i].orders.size(); }
@@ -56,6 +61,7 @@ class PaperVenue final : public Venue {
       if (a.is_cancel) {
         auto& v = books_[a.o.inst].orders;
         v.erase(std::remove_if(v.begin(), v.end(), [&](const Order& o) { return o.id == a.o.id; }), v.end());
+        if (on_cancel_) on_cancel_(a.o.inst, a.o.id);  // may re-enter submit/cancel (they only queue)
       } else {
         activate(a.o);
       }
@@ -155,6 +161,7 @@ class PaperVenue final : public Venue {
   std::deque<Action> pending_;
   std::vector<Book> books_;
   std::function<void(const Fill&)> on_fill_;
+  std::function<void(InstrumentId, OrderId)> on_cancel_;
 };
 
 }  // namespace amm::live

@@ -5,9 +5,15 @@
 import io
 import unittest
 
+import json
+import socket
+import struct
+
 import binance
+import binance_ws
 import coinbase
 import common
+import ws
 
 BINANCE_DEPTH = {"lastUpdateId": 1027024,
                  "bids": [["60000.10", "0.431"], ["60000.00", "2.0"]],
@@ -137,6 +143,204 @@ class Plumbing(unittest.TestCase):
         self.assertEqual(err.getvalue().count("network down"), 1)  # backed off, not retried every poll
         stamps = [int(l.split(",")[0]) for l in lines]
         self.assertEqual(stamps, sorted(stamps))
+
+
+# Websocket messages captured from the live Binance streams on 2026-11-15.
+REAL_WS_PERP_BOOK = '{"stream":"btcusdt@bookTicker","data":{"e":"bookTicker","u":12123442506725,"s":"BTCUSDT","ps":"BTCUSDT","b":"64725.80","B":"0.776","a":"64725.90","A":"1.647","T":1794753590558,"E":1794753590558,"st":1}}'
+REAL_WS_PERP_TRADE = '{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1794753591559,"a":3526044535,"s":"BTCUSDT","p":"64730.80","q":"0.028","nq":"0.028","f":8280153052,"l":8280153053,"T":1794753591449,"m":true,"st":1}}'
+REAL_WS_SPOT_BOOK = '{"stream":"btcusdt@bookTicker","data":{"u":102932694632,"s":"BTCUSDT","b":"64756.54000000","B":"3.61760000","a":"64756.55000000","A":"0.00875000"}}'
+REAL_WS_SPOT_TRADE = '{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1794753594557,"s":"BTCUSDT","a":4118908727,"p":"64756.55000000","q":"0.00020000","f":6864373052,"l":6864373052,"T":1794753594557,"m":false,"M":true}}'
+
+
+def server_frame(opcode, payload, fin=True):
+    """Unmasked server-to-client frame."""
+    n = len(payload)
+    head = bytes([(0x80 if fin else 0) | opcode])
+    if n < 126:
+        head += bytes([n])
+    elif n < 1 << 16:
+        head += bytes([126]) + struct.pack("!H", n)
+    else:
+        head += bytes([127]) + struct.pack("!Q", n)
+    return head + payload
+
+
+class WebsocketCodec(unittest.TestCase):
+    def test_accept_key_matches_rfc_example(self):
+        self.assertEqual(ws.accept_key("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+
+    def test_client_frames_are_masked_and_decode_back(self):
+        for n in (0, 5, 125, 126, 65535, 65536, 200000):
+            payload = bytes(range(256)) * (n // 256) + bytes(range(n % 256))
+            f = ws.encode_frame(ws.OP_TEXT, payload, mask_key=b"\x01\x02\x03\x04")
+            self.assertTrue(f[1] & 0x80)  # mask bit
+            self.assertEqual(ws.FrameDecoder().feed(f), [(ws.OP_TEXT, payload)])
+
+    def test_rfc_masked_hello(self):
+        # RFC 6455 section 5.7: a masked "Hello"
+        self.assertEqual(ws.encode_frame(ws.OP_TEXT, "Hello", mask_key=bytes.fromhex("37fa213d")),
+                         bytes.fromhex("818537fa213d7f9f4d5158"))
+
+    def test_decoder_reassembles_fragments_split_byte_by_byte(self):
+        stream = (server_frame(ws.OP_TEXT, b"Hel", fin=False) + server_frame(ws.OP_PING, b"x")
+                  + server_frame(ws.OP_CONT, b"lo", fin=True) + server_frame(ws.OP_BINARY, b"\x00" * 300))
+        d, out = ws.FrameDecoder(), []
+        for i in range(len(stream)):
+            out += d.feed(stream[i:i + 1])
+        self.assertEqual(out, [(ws.OP_PING, b"x"), (ws.OP_TEXT, b"Hello"), (ws.OP_BINARY, b"\x00" * 300)])
+
+    def test_decoder_rejects_protocol_errors(self):
+        for bad in (server_frame(ws.OP_CONT, b"x"),                  # continuation with nothing to continue
+                    server_frame(ws.OP_PING, b"x", fin=False),       # fragmented control frame
+                    bytes([0xC1, 0x00])):                            # reserved bit (compression not negotiated)
+            with self.assertRaises(ws.ProtocolError):
+                ws.FrameDecoder().feed(bad)
+
+
+class FakeServerSocket:
+    """Stands in for the TLS socket: serves a canned handshake reply, then frames."""
+
+    def __init__(self, frames):
+        self.a, self.b = socket.socketpair()
+        self.frames = frames
+        self.sent = b""
+
+    def __call__(self, addr, timeout):
+        return self
+
+    def sendall(self, data):
+        self.sent += data
+        if data.startswith(b"GET "):
+            key = [l.split(b": ")[1] for l in data.split(b"\r\n") if l.lower().startswith(b"sec-websocket-key")][0].decode()
+            self.b.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                            "Sec-WebSocket-Accept: %s\r\n\r\n" % ws.accept_key(key)).encode() + self.frames)
+
+    def recv(self, n):
+        return self.a.recv(n)
+
+    def setblocking(self, flag):
+        self.a.setblocking(flag)
+
+    def fileno(self):
+        return self.a.fileno()
+
+    def close(self):
+        self.a.close()
+        self.b.close()
+
+
+class WebsocketConnection(unittest.TestCase):
+    def test_handshake_messages_ping_and_close(self):
+        frames = (server_frame(ws.OP_TEXT, REAL_WS_PERP_BOOK.encode()) + server_frame(ws.OP_PING, b"hb")
+                  + server_frame(ws.OP_TEXT, REAL_WS_PERP_TRADE.encode()))
+        fake = FakeServerSocket(frames)
+        c = ws.WsConnection("ws://example.test/stream?streams=btcusdt@bookTicker", sock_factory=fake)
+        self.assertIn(b"GET /stream?streams=btcusdt@bookTicker HTTP/1.1", fake.sent)
+        self.assertEqual(c.read(), [REAL_WS_PERP_BOOK, REAL_WS_PERP_TRADE])
+        pong = ws.FrameDecoder().feed(fake.sent[fake.sent.index(b"\r\n\r\n") + 4:])
+        self.assertEqual(pong, [(ws.OP_PONG, b"hb")])  # answered the ping with its payload
+        fake.b.sendall(server_frame(ws.OP_CLOSE, struct.pack("!H", 1001) + b"going away"))
+        with self.assertRaises(ws.ConnectionClosed) as cm:
+            c.read()
+        self.assertIn("1001", str(cm.exception))
+
+    def test_handshake_with_wrong_accept_key_is_refused(self):
+        fake = FakeServerSocket(b"")
+        fake.sendall = lambda data: fake.b.sendall(b"HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: nope\r\n\r\n")
+        with self.assertRaises(ws.ProtocolError):
+            ws.WsConnection("ws://example.test/x", sock_factory=fake)
+
+
+class BinanceWebsocket(unittest.TestCase):
+    def test_real_messages(self):
+        ev = [binance_ws.to_event(m, p)[0] for m, p in ((REAL_WS_PERP_BOOK, "BINANCE-PERP:"), (REAL_WS_PERP_TRADE, "BINANCE-PERP:"),
+                                                        (REAL_WS_SPOT_BOOK, "BINANCE:"), (REAL_WS_SPOT_TRADE, "BINANCE:"))]
+        self.assertEqual(ev, [("B", "BINANCE-PERP:BTCUSDT", 64725.8, 0.776, 64725.9, 1.647),
+                              ("T", "BINANCE-PERP:BTCUSDT", 64730.8, 0.028, "S"),   # buyer was maker: aggressor sold
+                              ("B", "BINANCE:BTCUSDT", 64756.54, 3.6176, 64756.55, 0.00875),
+                              ("T", "BINANCE:BTCUSDT", 64756.55, 0.0002, "B")])
+        self.assertEqual(binance_ws.to_event(REAL_WS_PERP_TRADE, "X:")[2], 1794753591559)  # exchange time for latency stats
+        self.assertIsNone(binance_ws.to_event(REAL_WS_SPOT_BOOK, "X:")[2])                 # spot bookTicker carries none
+
+    def test_lines_match_the_rest_adapter_and_the_runner_format(self):
+        ev, _, _ = binance_ws.to_event(REAL_WS_PERP_BOOK, "BINANCE-PERP:")
+        self.assertEqual(common.line(1794753590600000000, ev[0], ev[1], *ev[2:]),
+                         "1794753590600000000,B,BINANCE-PERP:BTCUSDT,64725.8,0.776,64725.9,1.647")
+
+    def test_acks_and_bad_books_are_skipped(self):
+        self.assertIsNone(binance_ws.to_event('{"result":null,"id":1}', "X:")[0])
+        crossed = json.loads(REAL_WS_PERP_BOOK)
+        crossed["data"]["a"] = "64725.70"
+        self.assertIsNone(binance_ws.to_event(json.dumps(crossed), "X:")[0])
+
+    def test_stream_urls(self):
+        u = binance_ws.stream_urls(["BTCUSDT"], ["btcusdt", "ETHUSDT"])
+        self.assertEqual(u, [
+            ("wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker/btcusdt@aggTrade", "BINANCE:"),
+            ("wss://fstream.binance.com/public/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker", "BINANCE-PERP:"),
+            ("wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/ethusdt@aggTrade", "BINANCE-PERP:")])
+        legacy = "wss://fstream.binance.com/stream"
+        self.assertEqual(binance_ws.stream_urls([], ["BTCUSDT"], perp_book_url=legacy, perp_trade_url=legacy),
+                         [(legacy + "?streams=btcusdt@bookTicker/btcusdt@aggTrade", "BINANCE-PERP:")])
+        many = binance_ws.stream_urls([], ["S%d" % i for i in range(250)])
+        self.assertEqual(len(many), 4)  # 250 book + 250 trade streams, at most 200 per connection
+
+    def test_run_reconnects_a_dropped_connection_and_keeps_the_other(self):
+        t = [0]
+
+        def clock():
+            t[0] += 50_000_000  # 50 ms per call
+            return t[0]
+
+        class Conn:
+            def __init__(self, url, script):
+                self.a, self.b = socket.socketpair()
+                self.b.send(b"x")  # always readable
+                self.script = script
+                self.url = url
+
+            def fileno(self):
+                return self.a.fileno()
+
+            def read(self):
+                if not self.script:
+                    return []
+                step = self.script.pop(0)
+                if isinstance(step, Exception):
+                    raise step
+                return step
+
+            def close(self):
+                self.a.close()
+                self.b.close()
+
+        made = []
+
+        def connect(url):
+            n = sum(1 for u in made if u == url)
+            made.append(url)
+            if "book" in url:
+                return Conn(url, [[REAL_WS_PERP_BOOK]] + ([ws.ConnectionClosed("server closed (1001 )")] if n == 0 else []))
+            return Conn(url, [[REAL_WS_PERP_TRADE]] * 3)
+
+        out, err = io.StringIO(), io.StringIO()
+        specs = [("wss://x/book", "BINANCE-PERP:"), ("wss://x/trade", "BINANCE-PERP:")]
+        binance_ws.run(specs, duration=3.0, stats_every=0, out=out, err=err, connect=connect, clock=clock)
+        self.assertEqual(made.count("wss://x/book"), 2)   # dropped once, reconnected
+        self.assertEqual(made.count("wss://x/trade"), 1)  # untouched
+        self.assertIn("reconnect in 1s", err.getvalue())
+        lines = out.getvalue().splitlines()
+        self.assertEqual(sum(l.split(",")[1] == "B" for l in lines), 2)
+        self.assertEqual(sum(l.split(",")[1] == "T" for l in lines), 3)
+        stamps = [int(l.split(",")[0]) for l in lines]
+        self.assertEqual(stamps, sorted(stamps))
+
+    def test_tls_context_always_verifies(self):
+        ctx = common.ssl_context()
+        import ssl
+        self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(ctx.check_hostname)
+        self.assertGreater(ctx.cert_store_stats().get("x509_ca", 0), 0)
 
 
 if __name__ == "__main__":

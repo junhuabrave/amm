@@ -256,7 +256,20 @@ adverse selection and are counted there instead).
   (kill switch: cancel everything, decline RFQs).
 - **Order manager**: one bid and one ask per instrument; cancel/replace when
   the target moves by `requote_ticks` or the resting size is badly depleted,
-  otherwise queue position is kept.
+  otherwise queue position is kept. With `min_quote_life_ms` set, a quote
+  younger than that is kept unless it must go: the side is switched off, it
+  is larger than the position limit now allows, or it rests more
+  aggressively than the new target. Moves that would only make it more
+  aggressive wait. This bounds the order rate on tick-by-tick data.
+- **Orders in flight count against the limit.** A cancelled order can still
+  fill until the venue confirms the cancel (`Engine::on_cancel_done`; the
+  paper venue and the simulator both confirm). Until then its remaining size
+  is held as "closing" and subtracted from the room for new quotes, so the
+  worst case, every order still able to fill doing so, stays inside
+  `max_pos`. Found on first contact with websocket data: bursts of book
+  updates made the quote flicker, a dozen cancelled orders were still in
+  flight when the market jumped, and all of them filled (BTC reached 0.285
+  against a 0.1 limit). Tested by `runner_respects_position_limit_when_quotes_flicker`.
 
 ## 9. Execution model
 
@@ -322,11 +335,11 @@ Comparison modes (`sim/scenario.hpp`):
 
 | Mode | Mean P&L | St.dev across seeds | Sharpe (per run) | Max drawdown | Sniped loss | Hedge cost | RFQ hit ratio |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| naive | 47,258 | 23,173 | 3.2 | 16,462 | 12,208 | 53,957 | 65.1% |
-| siloed | 90,621 | 12,157 | 11.6 | 5,267 | 12,916 | 16,712 | 23.0% |
-| +fair | 116,936 | 9,812 | 15.1 | 2,968 | 10,695 | 15,062 | 24.3% |
-| +skew | 114,078 | 16,156 | 12.2 | 6,956 | 13,401 | 21,495 | 35.5% |
-| unified | 163,319 | 10,670 | 18.4 | 2,631 | 10,864 | 19,026 | 37.1% |
+| naive | 43,908 | 19,124 | 3.3 | 14,482 | 13,027 | 53,603 | 65.1% |
+| siloed | 90,999 | 10,894 | 11.8 | 3,968 | 13,726 | 16,466 | 23.2% |
+| +fair | 116,185 | 6,705 | 15.5 | 2,588 | 11,494 | 14,613 | 24.3% |
+| +skew | 113,576 | 16,577 | 12.2 | 6,147 | 14,228 | 21,253 | 35.5% |
+| unified | 160,891 | 9,229 | 18.4 | 2,375 | 11,632 | 18,417 | 36.9% |
 
 Sharpe is mean over st.dev of one-second P&L increments times sqrt(seconds),
 per run, not annualised.
@@ -340,7 +353,7 @@ Reading the table:
   that bond risk can be shed through futures and the index, lets the engine
   price RFQs tighter and win 37% instead of 23% at better total edge.
 - The two effects compound: unified earns 1.8x the siloed quoter's P&L with
-  about half the drawdown.
+  about 60% of the drawdown.
 
 ### How far these results go
 
@@ -387,7 +400,7 @@ of each other and of the engine.
 | Paper venue | `live/paper.hpp` | Matches our orders locally against the real book and prints |
 | Runner | `live/runner.hpp`, `apps/amm_run.cpp` | Reads events from a pipe or a file, drives engine and venue, records, reports |
 | Calibration | `live/calibrate.hpp`, `apps/amm_calibrate.cpp` | Volatility, jumps, correlation, spreads and fill curve from a journal |
-| Adapters | `feeds/*.py` | Binance spot and perpetuals, Coinbase; standard library only |
+| Adapters | `feeds/*.py` | Binance spot and perpetuals (REST polling, and websockets in `binance_ws.py` over `ws.py`), Coinbase; standard library only |
 | Sample data | `apps/amm_record_sim.cpp`, `feeds/synthetic.py` | Journals and a live-style stream with no network |
 
 **Why adapters are separate processes.** A venue adapter only has to print
@@ -396,9 +409,14 @@ engine, and replaced by a file. Adding a venue is one small file (see the
 docstring in `feeds/common.py`); adding an asset class to it is a config
 section. The shipped adapters poll REST endpoints, which is simple and has no
 dependencies but is limited to roughly one update per half second per symbol.
-That is adequate for paper trading and calibration and not for anything
-latency-sensitive; a websocket or native C++ feed handler writes the same
-lines.
+`binance_ws.py` writes the same lines from Binance's push streams: every
+top-of-book change (`bookTicker`, real time) and every aggregated trade
+(`aggTrade`; on futures these are pushed in batches about every 100 ms).
+Perpetual book and trades come on two connections (Binance's `/public` and
+`/market` routes), so a trade can be stamped a few milliseconds away from the
+book change it caused; `--perp-book-url` and `--perp-trade-url` can point both
+at the legacy combined route to keep them in one ordered connection. A native
+C++ feed handler would write the same lines again.
 
 **Paper venue rules.** Orders and cancels take effect one configured latency
 after they are sent. A trade printing through our price fills us; a trade at
@@ -432,22 +450,38 @@ Public prints identify the curve at and beyond the touch only; inside the
 spread it is an extrapolation that the engine's online estimator then corrects
 from its own fills.
 
-**Verified and not verified.** Tests cover the event format, both config
+**Verified and not verified.** Tests cover the event format, the config
 files, the paper venue's fill rules, replay determinism (a session recorded
-live replays to the identical result), warm-up, and calibration against a tape
-with known parameters. The adapters' parsers are tested against responses captured from the live
-Binance spot, Binance perpetual and Coinbase endpoints on 2026-11-15, and the
-resulting lines run through `amm_run`. What has not been done is a continuous
-live session: the build environment's shells have no route to any exchange,
-so the polling loop has only run against stand-ins. Rate limits and regional
-access are the things to watch on a first long run.
+live replays to the identical result), warm-up, calibration against a tape
+with known parameters, the websocket framing and handshake, and the position
+limit under quote flicker with orders in flight. The adapters' parsers are
+tested against responses and stream messages captured from the live Binance
+spot, Binance perpetual and Coinbase endpoints on 2026-11-15.
+
+Live sessions on Binance USD-M perpetuals (BTCUSDT, ETHUSDT), 2026-11-15:
+
+| | REST, 1 s polling | Websockets |
+|---|---:|---:|
+| Length | 300 s | 898 s |
+| Events | 5,656 | 765,302 (734k book changes, 31k trades) |
+| Exchange-to-receipt time, p50 / p99 | - | about 125 / 220 ms (includes clock offset) |
+| Calibrated BTC vol / k | 3.5 / 3.5 | 4.65 / 1.9 |
+| Paper orders per second | - | 15.2 (36.2 without `min_quote_life_ms`) |
+| Paper P&L on volume | -1.2 on 48k | -17.1 on 952k (-0.18 bp) |
+| Peak position vs limit | - | at the limit, never beyond |
+
+The websocket session ran with no drops or reconnects. Paper P&L stays
+biased downward for the reasons above; over this window BTC rose about 100
+USDT while both books sat long at their limits. No session has yet run for
+hours, through Binance's 24-hour disconnect, or in a busy market.
 
 ## 12. Roadmap
 
 Ordered by what blocks real use first.
 
-1. Run the adapters against the real venues and fix what first contact
-   shows; then a websocket (or native) feed for sub-second data.
+1. Done for Binance: REST and websocket adapters run against the live venue,
+   and first contact found and fixed the in-flight cancel breach (section 8).
+   Next: a native feed handler and a full-depth book for queue modelling.
 2. Calibrate on recorded sessions and replace the placeholder numbers in
    `config/crypto.ini`.
 3. A real order gateway behind `Venue` (testnet first), with acknowledgements,

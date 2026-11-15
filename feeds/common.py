@@ -15,17 +15,41 @@ network connection (see test_feeds.py).
 Standard library only: nothing to install.
 """
 import json
+import os
+import ssl
 import sys
 import time
 import urllib.error
 import urllib.request
 
 USER_AGENT = "amm-feed/0.1"
+SYSTEM_CA_FILES = ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt")
+_ctx_cache = {}
+
+
+def ssl_context(cafile=None):
+    """A verifying TLS context.
+
+    Some Python builds (the python.org macOS installer before its "Install
+    Certificates" step) ship with no CA bundle, so every HTTPS call fails
+    verification. If the default context holds no CA certificates, load the
+    operating system's bundle instead. Verification is never switched off.
+    """
+    cafile = cafile or os.environ.get("AMM_CAFILE")
+    if cafile not in _ctx_cache:
+        ctx = ssl.create_default_context(cafile=cafile)
+        if not cafile and ctx.cert_store_stats().get("x509_ca", 0) == 0:
+            for path in SYSTEM_CA_FILES:
+                if os.path.exists(path):
+                    ctx.load_verify_locations(cafile=path)
+                    break
+        _ctx_cache[cafile] = ctx
+    return _ctx_cache[cafile]
 
 
 def http_json(url, timeout=5.0):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
