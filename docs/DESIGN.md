@@ -486,7 +486,13 @@ Ordered by what blocks real use first.
    `config/crypto.ini`.
 3. A real order gateway behind `Venue` (testnet first), with acknowledgements,
    rejects, throttles and own-order filtering of the book; state snapshot and
-   recovery.
+   recovery. It ships with a drop copy: the venue's execution stream (on
+   Binance, the user-data stream's `ORDER_TRADE_UPDATE` / `ACCOUNT_UPDATE`) on
+   a connection separate from the order path, journalled append-only, and a
+   reconciler that rebuilds positions and open orders from it, checks them
+   against the engine's book and periodic REST snapshots, and alerts or stops
+   the engine on a mismatch. Today there is none: every fill comes from the
+   in-process paper venue.
 4. Multi-level ladders, queue-position model, and requote hysteresis tuned to
    venue fee schedules.
 5. Volatility surface (SVI per expiry, vega buckets as separate factors),
@@ -495,5 +501,6 @@ Ordered by what blocks real use first.
    (end-of-day) boundary terms.
 7. Pre-trade controls required by regulation (price collars, message limits,
    self-trade prevention at venue level) and an independent risk process that
-   can kill the engine.
+   can kill the engine, fed by the drop copy rather than by the
+   engine's own state.
 8. Sharding by underlying across cores; kernel-bypass I/O.
