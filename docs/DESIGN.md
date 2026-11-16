@@ -464,10 +464,42 @@ simulator) runs through the same runner and paper venue, and gives the same
 result every time. `amm_sweep` replays one journal under a grid of config
 overrides (`--set engine.gamma=0.01,0.05,0.2`, `--set instrument:*.max_pos=...`)
 on all cores and tabulates P&L, drawdown, order rate, how close each
-instrument came to its limit, and P&L per time slice (`--split N`). A
-15-minute journal replays in about 0.4 s. The same downward bias applies, and
-a setting chosen on one session is fitted to it: choose on one recording and
-confirm on another.
+instrument came to its limit, and P&L per time slice (`--split N`). The
+journal is read and parsed once and every run steps through it in lockstep,
+so a 12-setting grid over a 4-hour journal (800 MB, 11M events) takes about
+10 s; separate readers per run thrashed the file cache on an 8 GB machine and
+took 48 minutes.
+
+Paper P&L is strongly path dependent: one different fill changes every later
+quote, position and fill. On the 4-hour journal, changing ETH's k0 from 19.68
+to 19.7 moved P&L from +12 to -41. `--jitter N` therefore replays each
+setting N more times with every A0 and k0 scaled by a fixed factor within
++-1% and reports mean, spread and worst case; settings are compared on those
+ensembles. The same downward bias applies, and a setting chosen on one session
+is fitted to it: choose on one recording and confirm on another.
+
+What the sweeps found on Binance perpetuals (16 paths per setting):
+
+| gamma | quote life | 15 min, mean P&L | 4 h, mean P&L (st.dev) | 4 h orders/s |
+|---|---:|---:|---:|---:|
+| 0.05 | 1 s | -8.7 | -177 (14) | 8.3 |
+| 0.005 | 1 s | -5.8 | -115 (16) | 7.8 |
+| 0.005 | 2.5 s | 0.1 | -81 (13) | 5.7 |
+| 0.005 | 5 s | 14.3 | -2 (22) | 4.4 |
+| 0.005 | 10 s | 10.5 | 18.5 (21) | 3.3 |
+| 0.005 | 20 s | 11.8 | 8.9 (8) | 2.3 |
+| 0.05 | 10 s | 3.1 | -6 (10) | 3.5 |
+
+Requoting on every small move of fair value is what loses. The likely
+mechanism, not yet isolated: each cancel and replace gives up queue position,
+and the replacement joins the back of the queue just as the market moves. Keeping a quote for 5 to 20 seconds unless it
+must go (it is through fair value, too large, or switched off; section 8)
+turned a steady loss into a small gain on both journals and cut the order
+rate by more than half. Lower gamma helped at every quote life. With no
+minimum life the loss limit stopped the engine in two of three 4-hour runs.
+`config/binance_perp.ini` now uses gamma 0.005 and a 10 s quote life. Both
+instruments still reach their position limits in every run, so the limits,
+not the quotes, bound inventory risk here.
 
 **Verified and not verified.** Tests cover the event format, the config
 files, the paper venue's fill rules, replay determinism (a session recorded
@@ -482,18 +514,20 @@ Live sessions on Binance USD-M perpetuals (BTCUSDT, ETHUSDT), 2026-11-15:
 
 | | REST, 1 s polling | Websockets |
 |---|---:|---:|
-| Length | 300 s | 898 s |
-| Events | 5,656 | 765,302 (734k book changes, 31k trades) |
+| Length | 300 s | 898 s and 4 h |
+| Events | 5,656 | 765,302; 11.3M over 4 h (411k trades) |
 | Exchange-to-receipt time, p50 / p99 | - | about 125 / 220 ms (includes clock offset) |
-| Calibrated BTC vol / k | 3.5 / 3.5 | 4.65 / 1.9 |
-| Paper orders per second | - | 15.2 (36.2 without `min_quote_life_ms`) |
-| Paper P&L on volume | -1.2 on 48k | -17.1 on 952k (-0.18 bp) |
+| Calibrated BTC vol / k | 3.5 / 3.5 | 4.65 / 1.9 (15 min), 4.88 / 2.33 (4 h) |
+| Paper orders per second | - | 15.2 at 250 ms quote life, 36.2 at 0; 3.4 at 10 s (4 h) |
+| Paper P&L on volume | -1.2 on 48k | 250 ms: -17.1 on 952k (15 min); 10 s: +10.9 on 454k (15 min), +58.2 on 2.0M (4 h) |
 | Peak position vs limit | - | at the limit, never beyond |
 
-The websocket session ran with no drops or reconnects. Paper P&L stays
+The 4-hour session (2026-11-15 20:30 to 11-16 00:30 UTC) and the 15-minute one
+ran with no drops or reconnects; exchange-to-receipt latency stayed near
+70 to 100 ms median. Paper P&L stays
 biased downward for the reasons above; over this window BTC rose about 100
-USDT while both books sat long at their limits. No session has yet run for
-hours, through Binance's 24-hour disconnect, or in a busy market.
+USDT while both books sat long at their limits. No session has yet run
+through Binance's 24-hour disconnect, on a weekday, or in a busy market.
 
 ## 12. Roadmap
 

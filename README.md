@@ -53,9 +53,10 @@ python3 feeds/binance.py BTCUSDT ETHUSDT --perp BTCUSDT | ./build/amm_run --conf
 ./build/amm_run --config config/crypto.ini --replay data/session.csv
 ./build/amm_calibrate data/session.csv
 
-# backtest a grid of settings on the same recording (parallel; --split N shows P&L by time slice)
+# backtest a grid of settings on the same recording: one read of the file, runs in parallel,
+# --split N shows P&L by time slice, --jitter N averages over N perturbed paths per setting
 ./build/amm_sweep --config config/binance_perp.ini --replay data/session.csv \
-  --set engine.gamma=0.01,0.05,0.2 --set engine.min_quote_life_ms=0,250,1000 --split 4
+  --set engine.gamma=0.005,0.05 --set engine.min_quote_life_ms=1000,5000,10000 --jitter 15
 
 # no network: try the same pipe on a synthetic stream, or on a simulator journal
 python3 feeds/synthetic.py --seconds 600 | ./build/amm_run --config config/crypto.ini
