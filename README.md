@@ -6,10 +6,13 @@ from one codebase, one fair-value model and one risk book. Header-only C++20,
 no dependencies, with a deterministic multi-asset simulator, tests and a
 latency benchmark.
 
-**Status: research-grade core with a paper-trading path.** The quoting, risk
-and hedging logic is implemented and tested in simulation, and can be run
-against real public market data with orders matched locally. It never sends an
-order to a venue: there is no order API, persistence or regulatory tooling.
+**Status: research-grade core with paper trading and an untried order path.**
+The quoting, risk and hedging logic is implemented and tested in simulation,
+and runs against real public market data with orders matched locally. An
+order gateway for Binance USD-M futures (testnet by default), a pre-trade risk
+gate, a drop copy and a reconciler exist and are tested offline and in dry-run
+mode on live data, but have not yet traded on any venue. There is no engine
+state persistence or regulatory tooling.
 See [docs/DESIGN.md](docs/DESIGN.md) for scope, design and roadmap, and
 [docs/RESEARCH.md](docs/RESEARCH.md) for sources.
 
@@ -30,8 +33,9 @@ See [docs/DESIGN.md](docs/DESIGN.md) for scope, design and roadmap, and
 
 ```sh
 cmake -S . -B build && cmake --build build     # or: ./build.sh  (g++ >= 11 only)
-./build/amm_tests                              # 41 tests
+./build/amm_tests                              # 46 tests
 python3 feeds/test_feeds.py                    # adapter tests, offline
+python3 feeds/test_trading.py                  # gateway, drop copy, reconciler, offline
 ./build/amm_sim --seeds 24 --duration 1800 --detail
 ./build/amm_bench
 ```
@@ -83,6 +87,28 @@ python3 feeds/synthetic.py --seconds 600 | ./build/amm_run --config config/crypt
 - Paper P&L understates spread capture (flow that never printed is invisible)
   and shows adverse selection in full. See [DESIGN.md §11](docs/DESIGN.md).
 
+## Orders to a venue (Binance USD-M futures)
+
+```sh
+scripts/live_gateway.sh dry        # live market data, orders acknowledged locally: no keys, nothing sent
+export BINANCE_API_KEY=... BINANCE_API_SECRET=...   # testnet keys from testnet.binancefuture.com
+scripts/live_gateway.sh testnet    # orders to the testnet, priced off the testnet's own market
+touch data/live/KILL               # stop trading: everything is cancelled
+```
+
+- The engine writes order lines to a named pipe; `feeds/binance_gateway.py`
+  sends them (post-only quotes, IOC hedges) and writes execution reports back
+  into the engine's event stream. Mainnet needs `--mainnet` and
+  `AMM_ALLOW_MAINNET=MAINNET_REAL_MONEY`; the script does not offer it.
+- Every order passes a pre-trade gate (price collar, size, message rate,
+  open orders, self-trade, kill switch), in paper mode too.
+- `feeds/binance_dropcopy.py` journals the account's execution stream on its
+  own connection; `feeds/reconcile.py` compares engine, drop copy and venue
+  every second, and on a lasting difference writes the kill file and cancels
+  at the venue itself.
+- Not yet run on the testnet: that needs API keys only the account owner can
+  create. See [DESIGN.md §12](docs/DESIGN.md#12-live-path-orders-to-a-real-venue).
+
 ## Simulation results
 
 Twelve instruments on five correlated risk factors with jumps, noise takers,
@@ -119,11 +145,14 @@ for an underlying tick that requotes six instruments.
 ```
 include/amm/          engine library (core, factor, pricing, signals, quoter, linalg, engine)
 include/amm/sim/      matching engine, market simulator, reference scenario
-include/amm/live/     event format, config loader, paper venue, runner, calibration
+include/amm/live/     event format, config loader, paper venue, risk gate, gateway client, runner, calibration
 apps/                 amm_sim (comparison), amm_bench (latency), amm_run (paper trading),
                       amm_calibrate, amm_sweep (replay grid), amm_record_sim
-feeds/                venue adapters (Binance, Coinbase, synthetic) and their tests
-config/               sim.ini (reference universe), crypto.ini (starter live universe)
+feeds/                venue adapters (Binance, Coinbase, synthetic), Binance order gateway,
+                      drop copy, reconciler, and their tests
+scripts/              live_gateway.sh: the whole live stack (dry | testnet)
+config/               sim.ini (reference universe), crypto.ini (starter live universe),
+                      binance_perp.ini (BTC and ETH perpetuals, calibrated and swept)
 tests/                unit and end-to-end tests
 docs/                 DESIGN.md, RESEARCH.md
 ```
