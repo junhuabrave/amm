@@ -27,11 +27,18 @@ well-built single-instrument quoter:
 **In scope (implemented).** Quoting logic for order-book and RFQ markets, the
 factor model and pricers, online calibration, portfolio risk, hedging, limits
 and kill switch, a deterministic event-driven simulator with a matching engine,
-tests, and a latency benchmark.
+a paper-trading path on real market data (venue adapters, recorder, replay,
+calibration, file-based configuration), a parameter sweep over recorded
+sessions, an order path to a real venue (pre-trade risk gate, gateway process
+for Binance USD-M futures with testnet as default, drop copy, reconciler,
+kill file; section 12), tests, and a latency benchmark.
 
-**Out of scope (not implemented).** Exchange and venue connectivity (FIX, ITCH,
-OUCH, crypto websockets), multi-level order ladders and queue-position
-modelling, persistence and recovery, regulatory reporting and best-execution
+**Out of scope (not implemented).** Any session against a real venue with real
+or test money so far (the gateway has run in dry-run mode on live data only;
+testnet needs API keys only the owner can create), low-latency feeds (FIX,
+ITCH, OUCH; market data arrives over websockets or REST), multi-level order
+ladders and queue-position modelling, engine state persistence (a restart
+cancels everything and takes over venue positions), regulatory reporting and best-execution
 records, a real volatility surface (SVI/SABR, dividends, rates, American
 exercise), FPGA or kernel-bypass I/O, and calibration to historical data. These
 are listed again under *Roadmap*. Without them this is a research-grade core,
@@ -79,6 +86,7 @@ Files, all under `include/amm/`:
 | `sim/matching.hpp` | Price-time priority order book |
 | `sim/sim.hpp` | Market simulator |
 | `sim/scenario.hpp` | Reference 12-instrument universe and the comparison modes |
+| `live/*.hpp` | Event format, config loader, paper venue, runner, calibration (section 11) |
 
 The library is header-only C++20 with no dependencies.
 
@@ -254,7 +262,36 @@ adverse selection and are counted there instead).
   (kill switch: cancel everything, decline RFQs).
 - **Order manager**: one bid and one ask per instrument; cancel/replace when
   the target moves by `requote_ticks` or the resting size is badly depleted,
-  otherwise queue position is kept.
+  otherwise queue position is kept. With `min_quote_life_ms` set, a quote
+  younger than that is kept unless it must go: the side is switched off, it
+  is larger than the position limit now allows, or it rests more
+  aggressively than the new target. Moves that would only make it more
+  aggressive wait. This bounds the order rate on tick-by-tick data.
+- **Orders in flight count against the limit.** A cancelled order can still
+  fill until the venue confirms the cancel (`Engine::on_cancel_done`; the
+  paper venue and the simulator both confirm). Until then its remaining size
+  is held as "closing" and subtracted from the room for new quotes, so the
+  worst case, every order still able to fill doing so, stays inside
+  `max_pos`. Found on first contact with websocket data: bursts of book
+  updates made the quote flicker, a dozen cancelled orders were still in
+  flight when the market jumped, and all of them filled (BTC reached 0.285
+  against a 0.1 limit). Tested by `runner_respects_position_limit_when_quotes_flicker`.
+- **One order in flight per side** (`wait_cancel_ack`). A quote that has to go
+  is cancelled at once, but its replacement is sent only when the cancel is
+  confirmed. Without this, in fast markets the engine cancelled and replaced
+  on every book update while earlier cancels were still in flight: averages
+  of 3 orders a second hid bursts of hundreds, which a venue would throttle,
+  and the stacked orders filled adversely. Found by the pre-trade gate's
+  message-rate and open-order checks. On the 4-hour Binance journal mean paper
+  P&L went from +11 to +63 and drawdown from 67 to 27.
+- **Pre-trade gate** (`live/risk_gate.hpp`) between the engine and any venue,
+  paper or real: kill switch, price collar against the last mid, order size and
+  notional caps, a token-bucket message rate inside the venue's own limit,
+  open-order cap, and self-trade prevention (a passive order that would cross
+  our own resting order is refused; IOC hedges go through with the venue
+  told to cancel our resting side instead, Binance `EXPIRE_MAKER`). A refused
+  order returns id 0 and the engine treats it as not sent. Cancels are never
+  blocked.
 
 ## 9. Execution model
 
@@ -320,11 +357,11 @@ Comparison modes (`sim/scenario.hpp`):
 
 | Mode | Mean P&L | St.dev across seeds | Sharpe (per run) | Max drawdown | Sniped loss | Hedge cost | RFQ hit ratio |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| naive | 47,258 | 23,173 | 3.2 | 16,462 | 12,208 | 53,957 | 65.1% |
-| siloed | 90,621 | 12,157 | 11.6 | 5,267 | 12,916 | 16,712 | 23.0% |
-| +fair | 116,936 | 9,812 | 15.1 | 2,968 | 10,695 | 15,062 | 24.3% |
-| +skew | 114,078 | 16,156 | 12.2 | 6,956 | 13,401 | 21,495 | 35.5% |
-| unified | 163,319 | 10,670 | 18.4 | 2,631 | 10,864 | 19,026 | 37.1% |
+| naive | 43,908 | 19,124 | 3.3 | 14,482 | 13,027 | 53,603 | 65.1% |
+| siloed | 90,999 | 10,894 | 11.8 | 3,968 | 13,726 | 16,466 | 23.2% |
+| +fair | 116,185 | 6,705 | 15.5 | 2,588 | 11,494 | 14,613 | 24.3% |
+| +skew | 113,576 | 16,577 | 12.2 | 6,147 | 14,228 | 21,253 | 35.5% |
+| unified | 160,891 | 9,229 | 18.4 | 2,375 | 11,632 | 18,417 | 36.9% |
 
 Sharpe is mean over st.dev of one-second P&L increments times sqrt(seconds),
 per run, not annualised.
@@ -338,7 +375,7 @@ Reading the table:
   that bond risk can be shed through futures and the index, lets the engine
   price RFQs tighter and win 37% instead of 23% at better total edge.
 - The two effects compound: unified earns 1.8x the siloed quoter's P&L with
-  about half the drawdown.
+  about 60% of the drawdown.
 
 ### How far these results go
 
@@ -357,23 +394,273 @@ Reading the table:
 - No fees, financing, funding payments on the perp, capital charges or
   dividends.
 
-## 11. Roadmap
+## 11. Live path: paper trading on real market data
+
+The engine is connected to real markets through one seam, a normalised event
+stream, so that venues, recording, replay and calibration are all independent
+of each other and of the engine.
+
+```
+ venue adapter (one per venue,       normalised events (CSV lines)
+ any language, own process)   --->   B top of book / T trade / C composite
+ feeds/binance.py, coinbase.py                |
+                                              v
+                    +-------------------- amm_run ---------------------+
+  --record FILE <-- | journal    Runner: warm-up, timers, accounting   |
+                    |               |                     ^            |
+  --replay FILE --> | same code     v                     | fills      |
+                    |            Engine --- orders ---> PaperVenue     |
+                    +--------------------------------------------------+
+                                              |
+        amm_calibrate FILE  <--- journal -----+---> config/*.ini (vol, A0, k0, corr)
+```
+
+| Piece | File | What it does |
+|---|---|---|
+| Event format | `live/events.hpp` | Three line types; parse and format round-trip exactly |
+| Configuration | `live/config.hpp`, `config/*.ini` | Factors, correlations, instruments, pricers and engine parameters from a file; errors carry file and line |
+| Paper venue | `live/paper.hpp` | Matches our orders locally against the real book and prints |
+| Runner | `live/runner.hpp`, `apps/amm_run.cpp` | Reads events from a pipe or a file, drives engine and venue, records, reports |
+| Calibration | `live/calibrate.hpp`, `apps/amm_calibrate.cpp` | Volatility, jumps, correlation, spreads and fill curve from a journal |
+| Parameter sweep | `apps/amm_sweep.cpp` | Replays one journal under a grid of config overrides, in parallel; P&L, drawdown, order rate, peak positions, P&L by time slice |
+| Adapters | `feeds/*.py` | Binance spot and perpetuals (REST polling, and websockets in `binance_ws.py` over `ws.py`), Coinbase; standard library only |
+| Sample data | `apps/amm_record_sim.cpp`, `feeds/synthetic.py` | Journals and a live-style stream with no network |
+
+**Why adapters are separate processes.** A venue adapter only has to print
+lines. It can be written in any language, restarted without touching the
+engine, and replaced by a file. Adding a venue is one small file (see the
+docstring in `feeds/common.py`); adding an asset class to it is a config
+section. The shipped adapters poll REST endpoints, which is simple and has no
+dependencies but is limited to roughly one update per half second per symbol.
+`binance_ws.py` writes the same lines from Binance's push streams: every
+top-of-book change (`bookTicker`, real time) and every aggregated trade
+(`aggTrade`; on futures these are pushed in batches about every 100 ms).
+Perpetual book and trades come on two connections (Binance's `/public` and
+`/market` routes), so a trade can be stamped a few milliseconds away from the
+book change it caused; `--perp-book-url` and `--perp-trade-url` can point both
+at the legacy combined route to keep them in one ordered connection. A native
+C++ feed handler would write the same lines again.
+
+**Paper venue rules.** Orders and cancels take effect one configured latency
+after they are sent. A trade printing through our price fills us; a trade at
+our price fills us only after the size displayed ahead of us when we joined
+has traded; joining inside the spread puts nobody ahead. If the market quote
+crosses our resting price we fill once against the displayed size. IOC and
+marketable orders take the displayed size at the touch and no more. No order
+leaves the process: there is no order API in the codebase.
+
+**What paper trading cannot measure.** Flow that would have traded with our
+better price but never printed, because nobody was quoting there, is
+invisible. Adverse fills (the market running over a stale quote) are all
+visible. Paper P&L on recorded data is therefore biased downward for a quoter
+that sits inside the spread. Replaying the simulator's own journal shows the
+size of this: the same engine that earns in the full simulator loses on the
+replay, because the journal contains every sniper print but only the small
+share of benign takers who were willing to pay the background spread. Treat
+paper results as a check on behaviour, risk and adverse selection, not as an
+estimate of spread capture.
+
+**Warm-up.** The runner starts the engine only when every order-book
+instrument has a market, and feeds factor reference markets first, so factor
+levels come from the market and never from the rough values in the config.
+
+**Calibration.** Volatility is estimated from one-second mid changes by
+iterated truncation: start from the total, set aside moves beyond five
+sigmas as jumps, re-estimate from the rest, and repeat until the set of jumps
+stops changing. An earlier median-based scale failed on real tapes: Binance
+perpetual mids are unchanged in about half of all one-second samples (BTC 60%,
+ETH 48% on 2026-11-15), so the median move is zero or one tick, and ETH showed
+a diffusive vol of 0.015 with almost every ordinary move labelled a jump.
+Truncation gives 0.184 for ETH with two jumps in 15 minutes. Volatility
+measured over 1 to 60 second horizons is flat on these tapes (4.4 to 4.6 for
+BTC, 0.17 to 0.19 for ETH), so one-second sampling is not inflated by
+bid-ask bounce in the mid. The fill curve is measured the way a resting quote experiences it: a
+hypothetical quote is placed at each distance from the prevailing mid and
+counted as filled when a trade prints at or through it within the horizon.
+Public prints identify the curve at and beyond the touch only; inside the
+spread it is an extrapolation that the engine's online estimator then corrects
+from its own fills.
+
+**Backtesting.** Replay is the backtest: a journal recorded live (or from the
+simulator) runs through the same runner and paper venue, and gives the same
+result every time. `amm_sweep` replays one journal under a grid of config
+overrides (`--set engine.gamma=0.01,0.05,0.2`, `--set instrument:*.max_pos=...`)
+on all cores and tabulates P&L, drawdown, order rate, how close each
+instrument came to its limit, and P&L per time slice (`--split N`). The
+journal is read and parsed once and every run steps through it in lockstep,
+so a 12-setting grid over a 4-hour journal (800 MB, 11M events) takes about
+10 s; separate readers per run thrashed the file cache on an 8 GB machine and
+took 48 minutes.
+
+Paper P&L is strongly path dependent: one different fill changes every later
+quote, position and fill. On the 4-hour journal, changing ETH's k0 from 19.68
+to 19.7 moved P&L from +12 to -41. `--jitter N` therefore replays each
+setting N more times with every A0 and k0 scaled by a fixed factor within
++-1% and reports mean, spread and worst case; settings are compared on those
+ensembles. The same downward bias applies, and a setting chosen on one session
+is fitted to it: choose on one recording and confirm on another.
+
+What the sweeps found on Binance perpetuals (16 paths per setting):
+
+| gamma | quote life | 15 min, mean P&L | 4 h, mean P&L (st.dev) | 4 h orders/s |
+|---|---:|---:|---:|---:|
+| 0.05 | 1 s | -8.7 | -177 (14) | 8.3 |
+| 0.005 | 1 s | -5.8 | -115 (16) | 7.8 |
+| 0.005 | 2.5 s | 0.1 | -81 (13) | 5.7 |
+| 0.005 | 5 s | 14.3 | -2 (22) | 4.4 |
+| 0.005 | 10 s | 10.5 | 18.5 (21) | 3.3 |
+| 0.005 | 20 s | 11.8 | 8.9 (8) | 2.3 |
+| 0.05 | 10 s | 3.1 | -6 (10) | 3.5 |
+
+Requoting on every small move of fair value is what loses. The likely
+mechanism, not yet isolated: each cancel and replace gives up queue position,
+and the replacement joins the back of the queue just as the market moves. Keeping a quote for 5 to 20 seconds unless it
+must go (it is through fair value, too large, or switched off; section 8)
+turned a steady loss into a small gain on both journals and cut the order
+rate by more than half. Lower gamma helped at every quote life. With no
+minimum life the loss limit stopped the engine in two of three 4-hour runs.
+Both instruments reach their position limits in nearly every run, so the
+limits, not the quotes, bound inventory risk here.
+
+With one order in flight per side (section 8) the picture shifts again. Mean
+paper P&L over 8 jittered paths, gamma 0.005, cancel acks awaited, on three
+sessions (the third a weekday morning, 2026-11-16 08:19 to 08:37 UTC, 1.5M
+events; a network that intercepted TLS to Binance cut that recording short):
+
+| quote life | Sun 15 min | Sun 4 h | Mon 18 min | 4 h orders/s |
+|---|---:|---:|---:|---:|
+| 5 s | 5.1 | 52.7 | 7.5 | 1.9 |
+| 10 s | 3.2 | 63.2 | 8.2 | 1.3 |
+| 20 s | 7.7 | 52.0 | 13.3 | 0.9 |
+| 30 s | 7.8 | 87.7 | 12.2 | 0.8 |
+| 60 s | 14.5 | 51.9 | 6.3 | 0.6 |
+| 10 min | 4.6 | 58.0 | 18.5 | 0.2 |
+
+Every life from 5 s up is positive on all three; beyond 30 s the sessions
+disagree on the ranking and drawdown grows. `config/binance_perp.ini` uses
+gamma 0.005, a 30 s quote life and `wait_cancel_ack`. The spread between
+sessions is now larger than the spread between paths within a session, so
+more sessions, not finer grids, are what would sharpen the choice.
+
+**Verified and not verified.** Tests cover the event format, the config
+files, the paper venue's fill rules, replay determinism (a session recorded
+live replays to the identical result), warm-up, calibration against tapes
+with known parameters (including a mid that sits still for most samples),
+config overrides for sweeps, the websocket framing and handshake, and the position
+limit under quote flicker with orders in flight. The adapters' parsers are
+tested against responses and stream messages captured from the live Binance
+spot, Binance perpetual and Coinbase endpoints on 2026-11-15.
+
+Live sessions on Binance USD-M perpetuals (BTCUSDT, ETHUSDT), 2026-11-15:
+
+| | REST, 1 s polling | Websockets |
+|---|---:|---:|
+| Length | 300 s | 898 s and 4 h |
+| Events | 5,656 | 765,302; 11.3M over 4 h (411k trades) |
+| Exchange-to-receipt time, p50 / p99 | - | about 125 / 220 ms (includes clock offset) |
+| Calibrated BTC vol / k | 3.5 / 3.5 | 4.65 / 1.9 (15 min), 4.88 / 2.33 (4 h) |
+| Paper orders per second | - | 15.2 at 250 ms quote life, 36.2 at 0; 0.8 with the current config (4 h) |
+| Paper P&L on volume | -1.2 on 48k | 250 ms: -17.1 on 952k (15 min); current config: +8.7 on 74k (15 min), +70.8 on 555k (4 h), +12.3 on 59k (Mon 18 min) |
+| Peak position vs limit | - | at the limit, never beyond |
+
+The 4-hour session (2026-11-15 20:30 to 11-16 00:30 UTC) and the 15-minute one
+ran with no drops or reconnects; exchange-to-receipt latency stayed near
+70 to 100 ms median. Paper P&L stays
+biased downward for the reasons above; over this window BTC rose about 100
+USDT while both books sat long at their limits. No session has yet run
+through Binance's 24-hour disconnect, on a weekday, or in a busy market.
+
+## 12. Live path: orders to a real venue
+
+```
+ binance_ws.py ── market data ──> binance_gateway.py ──> amm_run --orders FIFO ──┐
+                                   ^   | REST orders,        (engine, risk gate,  │
+                                   |   | user-data stream    own-order filter,    │
+                                   |   v                     state snapshots)     │
+                                  Binance <── order lines (N/X/K) over FIFO ──────┘
+                                   │
+          binance_dropcopy.py <────┘ user-data stream, own connection ──> journal
+          reconcile.py: engine state vs drop copy vs REST ──> kill file + cancel all
+```
+
+**Protocol.** The engine writes one line per order action (`N` new, `X`
+cancel, `K` kill) to a named pipe; the gateway writes execution reports
+(`A` accepted, `F` fill, `D` done with a reason, `P` venue position, `G`
+gateway status) into the engine's event stream. The gateway is the only
+writer of that stream: market data reaches it on standard input and passes
+through as whole lines. Two processes writing into one pipe could interleave
+inside a line (macOS guarantees atomic pipe writes only up to 512 bytes).
+
+**Gateway** (`feeds/binance_gateway.py`, plumbing in `binance_trade.py`).
+Quotes go as post-only (`GTX`): rejected rather than allowed to take
+liquidity. Hedges go as IOC. Prices are rounded to the tick never more
+aggressively than asked, sizes down to the step; orders under the venue's
+minimum size or notional are refused locally. A cancel for an order still on
+its way is held until the venue has it, never sent before. A request that
+times out is resolved by asking the venue for the order rather than guessing.
+A 429 or 418 pauses new orders for the venue's retry-after. Startup cancels
+every open order on the configured symbols and reports positions; shutdown
+and kill cancel everything. Losing the user-data stream reports the gateway
+down, which stops the engine: without execution reports it cannot know its
+position. Testnet is the default; mainnet needs `--mainnet` and
+`AMM_ALLOW_MAINNET=MAINNET_REAL_MONEY`. Keys come from the environment and
+are never printed. `--dry-run` acknowledges and cancels locally with no keys
+and no network, to exercise the whole pipeline on live data.
+
+**Runner in gateway mode.** Waits for the gateway's ready; takes over venue
+positions before quoting; subtracts our accepted resting size from the
+displayed book, and holds a book update in which we are the whole touch
+(the next level is unknown from top of book, and passing it on would let
+fair value follow our own quote); stops on a venue position that still
+differs from its own after a 3 s grace (Binance sends the account update and
+the fill that explains it separately, in either order), a gateway reporting down, the loss limit, or a kill file; and
+writes a JSON state line every second.
+
+**Drop copy and reconciler.** `binance_dropcopy.py` holds its own connection
+to the account stream and journals every message, append-only, with a REST
+snapshot at start and after every reconnect. `reconcile.py` rebuilds
+positions and open orders from that journal and compares them with the
+engine's state and with REST every second. A difference lasting longer than
+the grace period (fills and cancels in flight make short ones normal), or an
+engine whose state has stopped updating, writes the kill file and cancels
+every open order itself, through a path independent of the engine and the
+gateway. `scripts/live_gateway.sh dry|testnet` runs the whole stack.
+
+**Verified.** C++ tests drive the runner through a full gateway session
+(ready, position takeover, ack, partial fill, venue expiry and requote,
+unknown reports, state snapshots, kill on a position mismatch, kill file).
+Python tests cover signing (against the worked example in Binance's API
+documentation), rounding, order ids, translation of user-data messages,
+the gateway's order handling with a fake venue (cancel ordering, rejects,
+rate limits, kill, timeouts) and the reconciler. A dry run on live Binance
+data sent 264 orders through the gateway in a minute, with every ack and
+cancel reconciled. **Not verified:** any session on the testnet or mainnet;
+the user-data message fixtures follow Binance's documented format rather
+than captured messages, because capturing them needs an account.
+
+## 13. Roadmap
 
 Ordered by what blocks real use first.
 
-1. Market-data and order gateways behind `Venue` (start with one equity venue
-   and one crypto venue), with own-order filtering of the book, order
-   acknowledgements, rejects and throttles.
-2. Event journal and replay; state snapshot and recovery.
-3. Calibration and backtest on recorded data: replace the simulator's assumed
-   fill curve and jump process with measured ones.
+1. Done for Binance: REST and websocket adapters run against the live venue,
+   and first contact found and fixed the in-flight cancel breach (section 8).
+   Next: a native feed handler and a full-depth book for queue modelling.
+2. Calibrate on recorded sessions and replace the placeholder numbers in
+   `config/crypto.ini`.
+3. Built for Binance USD-M futures, not yet run against a venue (section 12):
+   order gateway with acks, rejects, throttles, own-order filtering, startup
+   recovery (cancel all, take over positions), drop copy and reconciler.
+   Next: a testnet session (needs testnet API keys), captured user-data
+   messages as test fixtures, engine state persistence across restarts.
 4. Multi-level ladders, queue-position model, and requote hysteresis tuned to
    venue fee schedules.
 5. Volatility surface (SVI per expiry, vega buckets as separate factors),
    dividends and rates, American exercise for single-stock options.
 6. Exact treatment of idiosyncratic risk in the multi-asset term; finite-horizon
    (end-of-day) boundary terms.
-7. Pre-trade controls required by regulation (price collars, message limits,
-   self-trade prevention at venue level) and an independent risk process that
-   can kill the engine.
+7. Partly built: pre-trade gate (price collar, size, message rate, open
+   orders, self-trade), kill file, and the reconciler as an independent
+   process fed by the drop copy that can stop the engine and cancel at the
+   venue. Next: per-venue regulatory limits, audit trail of every order
+   decision, and alerting beyond log lines.
 8. Sharding by underlying across cores; kernel-bypass I/O.
