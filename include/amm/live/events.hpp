@@ -13,7 +13,7 @@
 //   <ts_ns>,F,<order id>,<price>,<qty>                       filled (partly or fully)
 //   <ts_ns>,D,<order id>,<reason>                            done: can no longer fill
 //   <ts_ns>,P,<symbol>,<qty>                                 venue's net position (startup, reconnect)
-//   <ts_ns>,G,<status>                                       gateway status: ready | down
+//   <ts_ns>,G,<status>                                       gateway status: ready | down | loopback
 //
 // Lines starting with '#' and blank lines are ignored.
 #pragma once

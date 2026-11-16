@@ -108,7 +108,7 @@ class Runner {
         tops_[id] = t;
         gate_.set_reference(id, t.mid());
         if (!warm_) { try_start(); break; }
-        if (gateway_mode()) {
+        if (gateway_mode() && !loopback_) {
           // Own orders are part of the displayed size; take them out. If we
           // are the whole touch, the next level is unknown from top of book,
           // and passing the book on would let fair value follow our own quote.
@@ -150,6 +150,7 @@ class Runner {
         break;
       case 'G':
         if (ev.sym == "ready") gw_ready_ = true;
+        else if (ev.sym == "loopback") loopback_ = true;  // dry run: our orders are not in the market's book
         else if (ev.sym == "down" && warm_) trip("gateway down");
         if (!warm_) try_start();
         break;
@@ -360,7 +361,7 @@ class Runner {
   std::vector<Account> acct_;
   std::vector<double> venue_pos_;
   TimeNs now_ = 0, first_ts_ = -1, next_timer_ = 0, next_status_ = 0, next_state_ = 0;
-  bool warm_ = false, gw_ready_ = false;
+  bool warm_ = false, gw_ready_ = false, loopback_ = false;
   uint64_t events_ = 0, unknown_ = 0, bad_lines_ = 0, fills_ = 0, venue_rejects_ = 0, alone_at_touch_ = 0;
   double volume_ = 0.0, peak_pnl_ = 0.0, max_dd_ = 0.0;
 };
