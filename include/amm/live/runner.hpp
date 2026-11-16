@@ -43,6 +43,10 @@ struct RunnerOptions {
   std::ostream* state = nullptr;   // state snapshots (JSON lines) for the reconciler
   double state_every_s = 1.0;
   double position_tolerance = 1e-9;  // venue vs own position, units
+  // A venue position report can arrive before the fill that explains it
+  // (Binance sends account and order updates separately), so only a
+  // mismatch lasting this long stops trading.
+  double position_grace_s = 3.0;
 };
 
 class Runner {
@@ -66,6 +70,7 @@ class Runner {
     tops_.assign(n, TopOfBook{});
     acct_.assign(n, Account{});
     venue_pos_.assign(n, kNaN);
+    mismatch_since_.assign(n, -1);
     for (size_t i = 0; i < n; ++i) {
       if (by_feed_.count(cfg.instruments[i].feed))
         throw std::runtime_error("feed symbol used twice: " + cfg.instruments[i].feed);
@@ -144,9 +149,6 @@ class Runner {
       case 'P':
         if (!gateway_mode()) break;
         venue_pos_[id] = ev.a;
-        if (warm_ && std::fabs(ev.a - acct_[id].pos) > opt_.position_tolerance)
-          trip("position mismatch on " + eng_.instrument(id).symbol + ": venue " + std::to_string(ev.a) +
-               ", ours " + std::to_string(acct_[id].pos));
         break;
       case 'G':
         if (ev.sym == "ready") gw_ready_ = true;
@@ -158,6 +160,7 @@ class Runner {
     }
     if (!warm_) return;
     if (eng_.halted() && !gate_.killed()) trip("engine loss limit");
+    if (gateway_mode()) check_positions();
     if (now_ >= next_timer_) {
       eng_.on_timer(now_);
       next_timer_ = now_ + ns(opt_.timer_s);
@@ -292,6 +295,18 @@ class Runner {
 
   static OrderId parse_id(const std::string& s) { return std::strtoull(s.c_str(), nullptr, 10); }
 
+  // Venue-reported positions against our own, after the grace period.
+  void check_positions() {
+    for (size_t i = 0; i < acct_.size(); ++i) {
+      const double v = venue_pos_[i];
+      if (!(v == v) || std::fabs(v - acct_[i].pos) <= opt_.position_tolerance) { mismatch_since_[i] = -1; continue; }
+      if (mismatch_since_[i] < 0) mismatch_since_[i] = now_;
+      if (now_ - mismatch_since_[i] >= ns(opt_.position_grace_s) && !gate_.killed())
+        trip("position mismatch on " + eng_.instrument(static_cast<InstrumentId>(i)).symbol + ": venue " +
+             std::to_string(v) + ", ours " + std::to_string(acct_[i].pos));
+    }
+  }
+
   // The engine starts once every order-book instrument has a market, so no
   // instrument is ever priced off a configured (stale) factor level. In
   // gateway mode the gateway must also be ready (it has cancelled leftover
@@ -360,6 +375,7 @@ class Runner {
   std::vector<TopOfBook> tops_;
   std::vector<Account> acct_;
   std::vector<double> venue_pos_;
+  std::vector<TimeNs> mismatch_since_;
   TimeNs now_ = 0, first_ts_ = -1, next_timer_ = 0, next_status_ = 0, next_state_ = 0;
   bool warm_ = false, gw_ready_ = false, loopback_ = false;
   uint64_t events_ = 0, unknown_ = 0, bad_lines_ = 0, fills_ = 0, venue_rejects_ = 0, alone_at_touch_ = 0;

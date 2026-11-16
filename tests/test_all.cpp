@@ -1062,8 +1062,19 @@ TEST(gateway_mode_round_trip) {
   for (int k = 0; k < 20; ++k) ev(t(0.1) + ",B," + ETH + ",1800,10,1800.01,10");
   CHECK(state.str().find("\"positions\":{\"BTC-USDT-PERP\":0.002,\"ETH-USDT-PERP\":0.5}") != std::string::npos);
   CHECK(state.str().find("\"killed\":false") != std::string::npos);
-  // the venue reports a position we do not hold: stop, cancel everything
+  // a venue position ahead of the fill that explains it: tolerated...
+  ev(t() + ",P," + BTC + ",0.004");
+  OrderId btc_order = 0;
+  for (const auto& [oid, o] : r.gateway().orders()) if (o.inst == 0 && !o.ioc && o.side == Side::Buy) btc_order = oid;
+  CHECK(btc_order != 0);
+  ev(t() + ",F," + std::to_string(btc_order) + ",65000,0.002");
+  CHECK(std::fabs(r.position(0) - 0.004) < 1e-12);
+  CHECK(!r.gate().killed());
+  // ...only if the fill arrives within the grace period. If it's not explained in time: stop, cancel everything
   ev(t() + ",P," + BTC + ",0.05");
+  ev(t(1.0) + ",B," + ETH + ",1800,10,1800.01,10");
+  CHECK(!r.gate().killed());
+  ev(t(2.5) + ",B," + ETH + ",1800,10,1800.01,10");
   CHECK(r.gate().killed());
   auto all = order_lines(orders.str());
   CHECK(!all.empty() && all.back()[0] == "K");

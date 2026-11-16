@@ -611,8 +611,9 @@ and no network, to exercise the whole pipeline on live data.
 positions before quoting; subtracts our accepted resting size from the
 displayed book, and holds a book update in which we are the whole touch
 (the next level is unknown from top of book, and passing it on would let
-fair value follow our own quote); stops on a position report that differs
-from its own, a gateway reporting down, the loss limit, or a kill file; and
+fair value follow our own quote); stops on a venue position that still
+differs from its own after a 3 s grace (Binance sends the account update and
+the fill that explains it separately, in either order), a gateway reporting down, the loss limit, or a kill file; and
 writes a JSON state line every second.
 
 **Drop copy and reconciler.** `binance_dropcopy.py` holds its own connection
