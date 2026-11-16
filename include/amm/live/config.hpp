@@ -6,7 +6,8 @@
 //   [factor NAME]                 level, vol (per sqrt second)
 //   [corr]                        A B = rho
 //   [instrument SYMBOL]           feed, class, protocol, tick, lot, mult, quote_size, max_pos,
-//                                 max_spread, fee, maker_fee, taker_fee, max_order_qty, idio_vol, A0, k0, rfq_a0, rfq_b0,
+//                                 max_spread, fee, maker_fee, taker_fee, max_order_qty, quote, lead, lead_beta,
+//                                 lead_tau_ms, lead_gain, idio_vol, A0, k0, rfq_a0, rfq_b0,
 //                                 ref_for, ref_gain, hedges, pricer
 //   pricer = linear FACTOR [a] [b] [l0]
 //          | option SPOT VOL strike expiry_years call|put [ratio] [smile_slope]
@@ -29,7 +30,7 @@ struct CorrCfg { std::string a, b; double rho = 0.0; };
 struct InstrumentCfg {
   Instrument in;
   std::string feed;                      // symbol as the venue adapter emits it
-  std::string ref_for, hedges;           // factor names
+  std::string ref_for, hedges, lead;     // factor names
   std::vector<std::string> pricer;       // tokens of the pricer spec
   double max_order_qty = 0.0;            // pre-trade cap per order; 0 = max_pos
   double maker_fee = 0.0, taker_fee = 0.0;  // fraction of notional (0.0002 = 2 bp); negative = rebate
@@ -180,6 +181,11 @@ inline LiveConfig parse_config(std::istream& is, const std::string& name = "conf
       else if (key == "rfq_b0") in.rfq_b0 = num();
       else if (key == "ref_gain") in.ref_gain = num();
       else if (key == "max_order_qty") ic.max_order_qty = num();
+      else if (key == "quote") in.quote = to_bool(val, where());
+      else if (key == "lead") ic.lead = val;
+      else if (key == "lead_beta") in.lead_beta = num();
+      else if (key == "lead_tau_ms") in.lead_tau_s = num() * 1e-3;
+      else if (key == "lead_gain") in.lead_gain = num();
       else if (key == "maker_fee") ic.maker_fee = num();
       else if (key == "taker_fee") ic.taker_fee = num();
       else if (key == "ref_for") ic.ref_for = val;
@@ -281,8 +287,10 @@ inline void build_engine(const LiveConfig& cfg, Engine& eng) {
       const double level = eng.factors().level(factor(ic.ref_for, ctx));
       in.fee += ic.maker_fee * level;
     }
-    if (!(in.tick > 0 && in.lot > 0 && in.mult > 0 && in.quote_size > 0 && in.max_pos > 0))
-      throw std::runtime_error(ctx + ": tick, lot, mult, quote_size and max_pos must all be > 0");
+    if (!(in.tick > 0 && in.lot > 0 && in.mult > 0))
+      throw std::runtime_error(ctx + ": tick, lot and mult must all be > 0");
+    if (in.quote && !(in.quote_size > 0 && in.max_pos > 0))
+      throw std::runtime_error(ctx + ": quote_size and max_pos must be > 0 (or quote = false for a reference market)");
     if (!(in.A0 > 0 && in.k0 > 0)) throw std::runtime_error(ctx + ": A0 and k0 must be > 0");
     const auto& p = ic.pricer;
     auto opt = [&](size_t i, double dflt) { return p.size() > i ? to_num(p[i], ctx + " pricer") : dflt; };
@@ -301,6 +309,10 @@ inline void build_engine(const LiveConfig& cfg, Engine& eng) {
     }
     if (!ic.ref_for.empty()) in.ref_for_factor = factor(ic.ref_for, ctx);
     if (!ic.hedges.empty()) in.hedges_factor = factor(ic.hedges, ctx);
+    if (!ic.lead.empty()) {
+      in.lead_factor = factor(ic.lead, ctx);
+      if (!(in.lead_tau_s > 0)) throw std::runtime_error(ctx + ": lead_tau_ms must be > 0");
+    }
     in.pricer = eng.add_pricer(std::move(pr));
     eng.add_instrument(in);
   }

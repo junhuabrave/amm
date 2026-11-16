@@ -146,6 +146,17 @@ fair = model(factor levels) + basis
 - **Factor volatilities** are estimated online (time-weighted EWMA of realised
   variance, bounded to 0.5x-4x of the prior), so spreads and skews widen after
   jumps and relax afterwards without a separate regime switch.
+- **Reference markets** (`quote = false`) are observed like any other: they
+  move their factor and keep a basis, but are never quoted. Several markets
+  can observe one factor (a perpetual and its spot market); the latest to
+  move pulls the factor, and each keeps its own basis.
+- **Lead-lag between factors** (`lead`, `lead_beta`, `lead_tau_ms`,
+  `lead_gain`, off by default). Correlation between factors enters risk, not
+  fair value: a move in one factor does not move another's level. For a
+  follower market, the engine tracks `x = ln(mid) - beta * ln(leader level)`
+  against its average over `tau`, and adds `mid * (exp(-gain * (x - avg)) - 1)`
+  to fair value: when the leader has moved and the follower has not, its fair
+  value moves first. Measured on Binance it did not help (section 11).
 
 ## 5. Quoting on order books
 
@@ -567,6 +578,25 @@ viability is a question of fee tier, which no parameter here changes.
 so by default it does not quote where it cannot pay the fee; set your own
 tier's rates (and `fees_in_quotes = false` with a rebate) to quote at the
 touch.
+
+**Cross-asset fair value on real data: no usable lead found so far.** The
+simulator's largest gain over a single-instrument quoter comes from fair
+value that moves before an instrument's own market. `feeds/leadlag.py`
+measures whether that exists between real markets, in receipt time (what the
+engine sees). BTC and ETH perpetuals, 4 hours, 50 ms grid: most of the
+co-movement is in the same 50 ms step (correlation 0.48 at lag 0, 0.12 one
+step either way). After a BTC move of at least 1 bp, ETH has made 63% of it
+within the same step and 95% within a second; after an ETH move, BTC makes
+36% and 71%. But as a predictor of the next move, the gap between a market
+and what its partner implies explains under 0.5% of the variance at every
+averaging window (0.25 to 5 s) and horizon (0.1 to 2 s). For ETH its sign is
+wrong: ETH's own moves, more frequent than the BTC-driven catch-ups, tend to
+continue. Swept as the lead-lag term on three sessions, it cost up to 59
+(4 h) and gained at most 5 (Monday). The first minutes of a spot-plus-perp
+recording show the same pattern for spot against the perpetual. On these
+markets the engine's cross-asset fair value has nothing to work with at the
+50 ms resolution a websocket feed gives; `config/binance_perp_spot.ini` keeps
+spot as reference markets for the longer test.
 
 **Verified and not verified.** Tests cover the event format, the config
 files, the paper venue's fill rules, replay determinism (a session recorded

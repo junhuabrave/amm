@@ -81,6 +81,12 @@ struct Instrument {
   double ref_gain = 1.0;                // Newton damping for that observation
   FactorId hedges_factor = kNoFactor;   // this instrument is the hedge for a factor
   int pricer = -1;
+  bool quote = true;  // false: a reference market, observed (factor, basis) but never quoted
+  // Lead-lag: when the leader factor has moved and this market has not yet
+  // followed, expect it to. Fair value moves by lead_gain times the deviation
+  // of ln(mid) - lead_beta * ln(leader level) from its average over lead_tau_s.
+  FactorId lead_factor = kNoFactor;
+  double lead_beta = 1.0, lead_tau_s = 1.0, lead_gain = 0.0;
 };
 
 struct Fill {

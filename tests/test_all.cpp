@@ -1158,6 +1158,42 @@ TEST(fees_are_charged_and_widen_quotes) {
   CHECK(q_fee.half > q_bare.half + 0.5 * 0.0002 * 64000);
 }
 
+TEST(reference_markets_are_watched_not_quoted_and_leaders_move_fair_value) {
+  // Factors L (leader) and F (follower); a quoted market on each, a reference
+  // market on L that is never quoted, and F set to follow L.
+  EngineConfig c;
+  c.hedge_band = 1e12; c.risk_limit = 1e12;
+  RecVenue v;
+  Engine e(c, &v);
+  const FactorId L = e.factors().add("L", 100.0, 0.01), F = e.factors().add("F", 50.0, 0.01);
+  auto inst = [&](FactorId f, bool quote, bool follow) {
+    Instrument in;
+    in.symbol = quote ? "q" : "ref";
+    in.cls = AssetClass::CryptoPerp; in.tick = 0.01; in.lot = 0.01; in.quote_size = 1; in.max_pos = 10;
+    in.A0 = 1; in.k0 = 10; in.quote = quote;
+    in.ref_for_factor = f;
+    in.pricer = e.add_pricer(std::make_unique<LinearPricer>(f));
+    if (follow) { in.lead_factor = L; in.lead_beta = 1.0; in.lead_tau_s = 1.0; in.lead_gain = 1.0; }
+    return e.add_instrument(in);
+  };
+  const InstrumentId lq = inst(L, true, false), lref = inst(L, false, false), fq = inst(F, true, true);
+  TimeNs ts = ns(1.0);
+  e.start(ts);
+  auto bk = [&](InstrumentId i, double mid) { e.on_book(i, TopOfBook{mid - 0.01, mid + 0.01, 5, 5, ts += ns(0.01)}); };
+  for (int k = 0; k < 300; ++k) { bk(lq, 100.0); bk(lref, 100.0); bk(fq, 50.0); }
+  for (const auto& o : v.orders) CHECK(o.inst != lref);  // never quoted
+  CHECK(!e.make_quote(lref).bid_on && !e.make_quote(lref).ask_on);
+  const double f0 = e.fair(fq);
+  NEAR(f0, 50.0, 0.01);
+  // the reference market jumps 1%: the leader factor moves, the follower's
+  // book has not, so its fair value moves up by about gain * 1%
+  bk(lref, 101.0);
+  CHECK(e.fair(fq) > f0 + 0.3);
+  // the follower's own book catches up: the extra term fades
+  for (int k = 0; k < 400; ++k) { bk(lref, 101.0); bk(lq, 101.0); bk(fq, 50.5); }
+  NEAR(e.fair(fq), 50.5, 0.02);
+}
+
 int main(int argc, char** argv) {
   const std::string filter = argc > 1 ? argv[1] : "";
   int ran = 0;

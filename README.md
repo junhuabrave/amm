@@ -33,7 +33,7 @@ See [docs/DESIGN.md](docs/DESIGN.md) for scope, design and roadmap, and
 
 ```sh
 cmake -S . -B build && cmake --build build     # or: ./build.sh  (g++ >= 11 only)
-./build/amm_tests                              # 47 tests
+./build/amm_tests                              # 48 tests
 python3 feeds/test_feeds.py                    # adapter tests, offline
 python3 feeds/test_trading.py                  # gateway, drop copy, reconciler, offline
 ./build/amm_sim --seeds 24 --duration 1800 --detail
@@ -56,6 +56,7 @@ python3 feeds/binance.py BTCUSDT ETHUSDT --perp BTCUSDT | ./build/amm_run --conf
 # replay the recorded session (identical result), then calibrate from it
 ./build/amm_run --config config/crypto.ini --replay data/session.csv
 ./build/amm_calibrate data/session.csv
+python3 feeds/leadlag.py data/session.csv BINANCE:BTCUSDT BINANCE-PERP:BTCUSDT   # does one market move first?
 
 # backtest a grid of settings on the same recording: one read of the file, runs in parallel,
 # --split N shows P&L by time slice, --jitter N averages over N perturbed paths per setting
@@ -155,7 +156,8 @@ feeds/                venue adapters (Binance, Coinbase, synthetic), Binance ord
                       drop copy, reconciler, and their tests
 scripts/              live_gateway.sh: the whole live stack (dry | testnet)
 config/               sim.ini (reference universe), crypto.ini (starter live universe),
-                      binance_perp.ini (BTC and ETH perpetuals, calibrated and swept)
+                      binance_perp.ini (BTC and ETH perpetuals, calibrated and swept),
+                      binance_perp_spot.ini (the same, with spot BTC and ETH as reference markets)
 tests/                unit and end-to-end tests
 docs/                 DESIGN.md, RESEARCH.md
 ```
