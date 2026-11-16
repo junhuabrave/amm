@@ -154,7 +154,7 @@ def order_params(sym, side, px, qty, tif, cid, filters):
 def reports_from_user_event(msg, tag, prefix):
     """One user-data message -> list of report tuples for the engine.
 
-    ('A', id) accepted, ('F', id, px, qty) fill, ('D', id, reason) done,
+    ('A', id) accepted, ('F', id, px, qty, taker) fill, ('D', id, reason) done,
     ('P', symbol, qty) position. Orders from other sessions are skipped.
     """
     e = msg.get("e")
@@ -168,7 +168,7 @@ def reports_from_user_event(msg, tag, prefix):
         if x == "NEW":
             out.append(("A", eid))
         elif x == "TRADE":
-            out.append(("F", eid, float(o["L"]), float(o["l"])))
+            out.append(("F", eid, float(o["L"]), float(o["l"]), not o.get("m", True)))
             if status == "FILLED":
                 out.append(("D", eid, "filled"))
         elif x in ("CANCELED", "EXPIRED", "CALCULATED") or status in ("CANCELED", "EXPIRED", "EXPIRED_IN_MATCH"):
@@ -187,7 +187,7 @@ def report_line(ts_ns, r):
     if r[0] == "A":
         return "%d,A,%d" % (ts_ns, r[1])
     if r[0] == "F":
-        return "%d,F,%d,%r,%r" % (ts_ns, r[1], r[2], r[3])
+        return "%d,F,%d,%r,%r,%s" % (ts_ns, r[1], r[2], r[3], "T" if len(r) > 4 and r[4] else "M")
     if r[0] == "D":
         return "%d,D,%d,%s" % (ts_ns, r[1], r[2].replace(",", " "))
     if r[0] == "P":

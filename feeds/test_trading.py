@@ -38,10 +38,10 @@ EXCHANGE_INFO = {"symbols": [
 ]}
 
 
-def otu(cid, x, X, s="BTCUSDT", side="BUY", l="0", L="0", z="0"):
+def otu(cid, x, X, s="BTCUSDT", side="BUY", l="0", L="0", z="0", m=True):
     return {"e": "ORDER_TRADE_UPDATE", "E": 1, "T": 1, "o": {
         "s": s, "c": cid, "S": side, "o": "LIMIT", "f": "GTX", "q": "0.005", "p": "65000",
-        "x": x, "X": X, "i": 123, "l": l, "z": z, "L": L, "m": True, "ps": "BOTH"}}
+        "x": x, "X": X, "i": 123, "l": l, "z": z, "L": L, "m": m, "ps": "BOTH"}}
 
 
 class Signing(unittest.TestCase):
@@ -137,9 +137,9 @@ class UserStream(unittest.TestCase):
         cid = bt.client_id(self.tag, 42)
         self.assertEqual(self.reports(otu(cid, "NEW", "NEW")), [("A", 42)])
         self.assertEqual(self.reports(otu(cid, "TRADE", "PARTIALLY_FILLED", l="0.002", L="65000.1")),
-                         [("F", 42, 65000.1, 0.002)])
-        self.assertEqual(self.reports(otu(cid, "TRADE", "FILLED", l="0.003", L="65000.1")),
-                         [("F", 42, 65000.1, 0.003), ("D", 42, "filled")])
+                         [("F", 42, 65000.1, 0.002, False)])
+        self.assertEqual(self.reports(otu(cid, "TRADE", "FILLED", l="0.003", L="65000.1", m=False)),
+                         [("F", 42, 65000.1, 0.003, True), ("D", 42, "filled")])
         self.assertEqual(self.reports(otu(cid, "CANCELED", "CANCELED")), [("D", 42, "cancelled")])
         self.assertEqual(self.reports(otu(cid, "EXPIRED", "EXPIRED")), [("D", 42, "expired")])  # GTX that would take
         self.assertEqual(self.reports(otu(cid, "EXPIRED", "EXPIRED_IN_MATCH")), [("D", 42, "expired self-trade")])
@@ -152,7 +152,8 @@ class UserStream(unittest.TestCase):
         self.assertEqual(self.reports(acct), [("P", "BINANCE-PERP:BTCUSDT", 0.005), ("P", "BINANCE-PERP:ETHUSDT", -1.5)])
 
     def test_report_lines_parse_in_the_engine_format(self):
-        self.assertEqual(bt.report_line(5, ("F", 42, 65000.1, 0.002)), "5,F,42,65000.1,0.002")
+        self.assertEqual(bt.report_line(5, ("F", 42, 65000.1, 0.002, False)), "5,F,42,65000.1,0.002,M")
+        self.assertEqual(bt.report_line(5, ("F", 42, 65000.1, 0.002, True)), "5,F,42,65000.1,0.002,T")
         self.assertEqual(bt.report_line(5, ("D", 42, "rejected -2010, x")), "5,D,42,rejected -2010  x")
         self.assertEqual(bt.report_line(5, ("G", "ready")), "5,G,ready")
 

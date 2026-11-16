@@ -38,7 +38,7 @@ struct Axis { std::string section, key; std::vector<std::string> values; };
 struct Result {
   std::vector<std::string> values;
   size_t point = 0;  // grid point; jittered copies share it
-  double pnl = 0, dd = 0, volume = 0, orders_s = 0;
+  double pnl = 0, dd = 0, volume = 0, orders_s = 0, fees = 0;
   uint64_t fills = 0;
   std::vector<double> peak_frac;  // peak |position| / max_pos per instrument
   std::vector<double> slices;     // P&L earned in each time slice
@@ -107,6 +107,7 @@ void finish(Run& run, const LiveConfig& cfg, double width) {
   r.pnl = runner.pnl();
   r.dd = runner.max_drawdown();
   r.volume = runner.volume();
+  r.fees = runner.fees();
   r.fills = runner.fills();
   r.orders_s = runner.venue().orders_sent() / std::max(1e-9, runner.elapsed_s());
   r.halted = run.runner->engine().halted();
@@ -220,7 +221,7 @@ int main(int argc, char** argv) {
     const LiveConfig& c0 = cfgs.front();
     std::printf("%zu runs on %s\n\n", res.size(), replay.c_str());
     for (const Axis& a : axes) std::printf("%-*s ", int(std::max<size_t>(10, (a.section + "." + a.key).size())), (a.section + "." + a.key).c_str());
-    std::printf("%10s %9s %8s %12s %9s", "P&L", "max dd", "fills", "volume", "orders/s");
+    std::printf("%10s %9s %9s %8s %12s %9s", "P&L", "fees", "max dd", "fills", "volume", "orders/s");
     for (const auto& ic : c0.instruments) std::printf(" %10.10s", ("peak " + ic.in.symbol).c_str());
     for (int s = 0; s < split; ++s) std::printf(" %8s", ("slice" + std::to_string(s + 1)).c_str());
     std::printf("\n");
@@ -230,18 +231,19 @@ int main(int argc, char** argv) {
         std::printf("%-*s ", int(std::max<size_t>(10, (axes[k].section + "." + axes[k].key).size())), r.values[k].c_str());
       if (!r.error.empty()) { std::printf("error: %s\n", r.error.c_str()); continue; }
       if (!r.warm) { std::printf("engine never started (no book for every instrument)\n"); continue; }
-      std::printf("%10.2f %9.2f %8llu %12.0f %9.1f", r.pnl, r.dd, static_cast<unsigned long long>(r.fills), r.volume, r.orders_s);
+      std::printf("%10.2f %9.2f %9.2f %8llu %12.0f %9.1f", r.pnl, r.fees, r.dd, static_cast<unsigned long long>(r.fills), r.volume, r.orders_s);
       for (double p : r.peak_frac) std::printf(" %9.0f%%", 100 * p);
       for (double s : r.slices) std::printf(" %8.2f", s);
       std::printf("%s\n", r.halted ? "  HALTED" : "");
     }
     if (jitter > 0) {
-      struct Agg { double sum = 0, sq = 0, lo = 1e300, dd = 0, ord = 0; int n = 0; };
+      struct Agg { double sum = 0, sq = 0, lo = 1e300, dd = 0, ord = 0, fees = 0, vol = 0; int n = 0; };
       std::vector<Agg> agg(grid.size());
       for (const Result& r : res) {
         if (!r.error.empty() || !r.warm) continue;
         Agg& a = agg[r.point];
-        a.sum += r.pnl; a.sq += r.pnl * r.pnl; a.lo = std::min(a.lo, r.pnl); a.dd += r.dd; a.ord += r.orders_s; ++a.n;
+        a.sum += r.pnl; a.sq += r.pnl * r.pnl; a.lo = std::min(a.lo, r.pnl); a.dd += r.dd; a.ord += r.orders_s;
+        a.fees += r.fees; a.vol += r.volume; ++a.n;
       }
       std::vector<size_t> pts(grid.size());
       for (size_t i = 0; i < pts.size(); ++i) pts[i] = i;
@@ -249,14 +251,15 @@ int main(int argc, char** argv) {
       std::stable_sort(pts.begin(), pts.end(), [&](size_t a, size_t b) { return mean(a) > mean(b); });
       std::printf("\nby setting, over %d jittered copies each (A0, k0 within +-1%%):\n", jitter + 1);
       for (const Axis& a : axes) std::printf("%-*s ", int(std::max<size_t>(10, (a.section + "." + a.key).size())), (a.section + "." + a.key).c_str());
-      std::printf("%10s %9s %9s %9s %9s %6s\n", "mean P&L", "st.dev", "worst", "mean dd", "orders/s", "runs");
+      std::printf("%10s %9s %9s %9s %9s %11s %9s %6s\n", "mean P&L", "st.dev", "worst", "mean dd", "fees", "volume", "orders/s", "runs");
       for (size_t i : pts) {
         const Agg& a = agg[i];
         for (size_t k = 0; k < axes.size(); ++k)
           std::printf("%-*s ", int(std::max<size_t>(10, (axes[k].section + "." + axes[k].key).size())), grid[i][k].c_str());
         if (!a.n) { std::printf("no completed runs\n"); continue; }
         const double m = a.sum / a.n, sd = a.n > 1 ? std::sqrt(std::max(0.0, (a.sq - a.n * m * m) / (a.n - 1))) : 0.0;
-        std::printf("%10.2f %9.2f %9.2f %9.2f %9.1f %6d\n", m, sd, a.lo, a.dd / a.n, a.ord / a.n, a.n);
+        std::printf("%10.2f %9.2f %9.2f %9.2f %9.2f %11.0f %9.1f %6d\n", m, sd, a.lo, a.dd / a.n, a.fees / a.n, a.vol / a.n,
+                    a.ord / a.n, a.n);
       }
     }
     std::printf("\npeak = largest |position| as a share of max_pos. Paper P&L understates spread capture;\n"
@@ -266,14 +269,14 @@ int main(int argc, char** argv) {
       std::ofstream out(csv);
       if (!out) throw std::runtime_error("cannot write " + csv);
       for (const Axis& a : axes) out << a.section << '.' << a.key << ',';
-      out << "pnl,max_dd,fills,volume,orders_per_s,halted";
+      out << "pnl,fees,max_dd,fills,volume,orders_per_s,halted";
       for (const auto& ic : c0.instruments) out << ",peak_frac_" << ic.in.symbol;
       for (int s = 0; s < split; ++s) out << ",slice" << s + 1;
       out << ",error\n";
       for (size_t i : order) {
         const Result& r = res[i];
         for (const auto& v : r.values) out << v << ',';
-        out << r.pnl << ',' << r.dd << ',' << r.fills << ',' << r.volume << ',' << r.orders_s << ',' << r.halted;
+        out << r.pnl << ',' << r.fees << ',' << r.dd << ',' << r.fills << ',' << r.volume << ',' << r.orders_s << ',' << r.halted;
         for (size_t k = 0; k < c0.instruments.size(); ++k) out << ',' << (k < r.peak_frac.size() ? r.peak_frac[k] : 0.0);
         for (int s = 0; s < split; ++s) out << ',' << (size_t(s) < r.slices.size() ? r.slices[s] : 0.0);
         out << ',' << r.error << '\n';

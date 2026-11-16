@@ -10,7 +10,7 @@
 // its execution reports into the same stream:
 //
 //   <ts_ns>,A,<order id>                                     accepted by the venue
-//   <ts_ns>,F,<order id>,<price>,<qty>                       filled (partly or fully)
+//   <ts_ns>,F,<order id>,<price>,<qty>[,M|T]                 filled (partly or fully); maker or taker
 //   <ts_ns>,D,<order id>,<reason>                            done: can no longer fill
 //   <ts_ns>,P,<symbol>,<qty>                                 venue's net position (startup, reconnect)
 //   <ts_ns>,G,<status>                                       gateway status: ready | down | loopback
@@ -62,7 +62,9 @@ inline bool parse_event(const std::string& line, MdEvent& ev) {
       return true;
     case 'C': return n == 4 && num(3, ev.a);
     case 'A': case 'G': return n == 3;
-    case 'F': return n == 5 && num(3, ev.a) && num(4, ev.b);
+    case 'F':
+      ev.c = n == 6 && !f[5].empty() && f[5][0] == 'T' ? 1.0 : 0.0;  // taker flag; maker if absent
+      return (n == 5 || n == 6) && num(3, ev.a) && num(4, ev.b);
     case 'D': ev.text = n >= 4 ? f[3] : ""; return n >= 3;
     case 'P': return n == 4 && num(3, ev.a);
     default: return false;
@@ -75,7 +77,7 @@ inline std::string format_event(const MdEvent& ev) {
     case 'B': std::snprintf(buf, sizeof buf, "%lld,B,%s,%.17g,%.17g,%.17g,%.17g", static_cast<long long>(ev.ts), ev.sym.c_str(), ev.a, ev.b, ev.c, ev.d); break;
     case 'T': std::snprintf(buf, sizeof buf, "%lld,T,%s,%.17g,%.17g,%c", static_cast<long long>(ev.ts), ev.sym.c_str(), ev.a, ev.b, ev.c > 0 ? 'B' : 'S'); break;
     case 'A': case 'G': std::snprintf(buf, sizeof buf, "%lld,%c,%s", static_cast<long long>(ev.ts), ev.type, ev.sym.c_str()); break;
-    case 'F': std::snprintf(buf, sizeof buf, "%lld,F,%s,%.17g,%.17g", static_cast<long long>(ev.ts), ev.sym.c_str(), ev.a, ev.b); break;
+    case 'F': std::snprintf(buf, sizeof buf, "%lld,F,%s,%.17g,%.17g,%c", static_cast<long long>(ev.ts), ev.sym.c_str(), ev.a, ev.b, ev.c > 0 ? 'T' : 'M'); break;
     case 'D': std::snprintf(buf, sizeof buf, "%lld,D,%s,%s", static_cast<long long>(ev.ts), ev.sym.c_str(), ev.text.c_str()); break;
     case 'P': std::snprintf(buf, sizeof buf, "%lld,P,%s,%.17g", static_cast<long long>(ev.ts), ev.sym.c_str(), ev.a); break;
     default:  std::snprintf(buf, sizeof buf, "%lld,C,%s,%.17g", static_cast<long long>(ev.ts), ev.sym.c_str(), ev.a); break;

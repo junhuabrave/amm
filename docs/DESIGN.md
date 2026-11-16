@@ -537,10 +537,36 @@ events; a network that intercepted TLS to Binance cut that recording short):
 | 10 min | 4.6 | 58.0 | 18.5 | 0.2 |
 
 Every life from 5 s up is positive on all three; beyond 30 s the sessions
-disagree on the ranking and drawdown grows. `config/binance_perp.ini` uses
-gamma 0.005, a 30 s quote life and `wait_cancel_ack`. The spread between
-sessions is now larger than the spread between paths within a session, so
-more sessions, not finer grids, are what would sharpen the choice.
+disagree on the ranking and drawdown grows. The spread between sessions is
+now larger than the spread between paths within a session, so more
+sessions, not finer grids, are what would sharpen the choice.
+
+**Fees decide it.** Everything above ignored trading fees, and the paper
+venue let a quote that was marketable on arrival take liquidity, which the
+post-only orders the gateway sends cannot do. With both corrected (maker and
+taker fees charged on every fill; quotes post-only in paper as live), mean
+paper P&L at gamma 0.005 and a 30 s quote life, 4 jittered paths each:
+
+| maker fee | quotes | Sun 15 min | Mon 18 min | Sun 4 h | 4 h volume |
+|---|---|---:|---:|---:|---:|
+| 0.02% (Binance base tier) | at the touch | -11.4 | +5.5 | -5.3 | 338k |
+| 0.02% | widened by the fee | -2.5 | -3.4 | +69.4 | 30k |
+| 0.01% | at the touch | -6.6 | +9.5 | +28.5 | 338k |
+| 0 | at the touch | -1.8 | +13.4 | +62.3 | 338k |
+| -0.005% (rebate) | at the touch | +0.6 | +15.4 | +79.2 | 338k |
+
+At the base tier, quoting at the touch loses: the earlier positive results
+were mostly fees not paid and fills a post-only order could not have had.
+Widening quotes by the fee (`fees_in_quotes`, 13 USDT a side on BTC against a
+0.1 spread) makes the engine rarely quote; the 4-hour gain rests on 172
+fills during a few large moves and is not evidence of an edge. At-the-touch
+quoting is positive on all three sessions only with a maker rebate, and
+breaks even near a 0.01% maker fee. So on these markets the strategy's
+viability is a question of fee tier, which no parameter here changes.
+`config/binance_perp.ini` ships the base-tier fees with `fees_in_quotes` on,
+so by default it does not quote where it cannot pay the fee; set your own
+tier's rates (and `fees_in_quotes = false` with a rebate) to quote at the
+touch.
 
 **Verified and not verified.** Tests cover the event format, the config
 files, the paper venue's fill rules, replay determinism (a session recorded

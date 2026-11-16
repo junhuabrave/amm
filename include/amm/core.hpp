@@ -90,6 +90,7 @@ struct Fill {
   TimeNs ts = 0;
   OrderId oid = 0;
   bool hedge = false;
+  bool taker = false;     // we took liquidity (pays the taker fee)
 };
 
 // Outbound order interface. The engine is written against this only, so the

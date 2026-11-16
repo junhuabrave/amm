@@ -58,12 +58,15 @@ class Runner {
     build_engine(cfg, eng_);
     const size_t n = eng_.instruments();
     paper_.resize(n);
+    paper_.set_post_only(cfg.paper_post_only);
     std::vector<double> maxq(n), mult(n);
     std::vector<std::string> feeds(n);
     for (size_t i = 0; i < n; ++i) {
       maxq[i] = cfg.instruments[i].max_order_qty > 0 ? cfg.instruments[i].max_order_qty : cfg.instruments[i].in.max_pos;
       mult[i] = cfg.instruments[i].in.mult;
       feeds[i] = cfg.instruments[i].feed;
+      maker_fee_.push_back(cfg.instruments[i].maker_fee);
+      taker_fee_.push_back(cfg.instruments[i].taker_fee);
     }
     gate_.resize(n, maxq, mult);
     gw_.attach(opt.orders, feeds);
@@ -136,7 +139,7 @@ class Runner {
       case 'A': gw_.on_ack(parse_id(ev.sym)); break;
       case 'F': {
         Fill f;
-        if (gw_.on_fill(parse_id(ev.sym), ev.a, ev.b, now_, f)) on_fill(f);
+        if (gw_.on_fill(parse_id(ev.sym), ev.a, ev.b, now_, f, ev.c > 0)) on_fill(f);
         break;
       }
       case 'D': {
@@ -206,6 +209,7 @@ class Runner {
   double peak_position(InstrumentId i) const { return acct_[i].peak; }  // largest |position| reached
   uint64_t fills() const { return fills_; }
   double volume() const { return volume_; }
+  double fees() const { return fees_; }  // paid (negative: rebates received); already in pnl()
   double max_drawdown() const { return max_dd_; }  // of P&L sampled every timer_s
   uint64_t events() const { return events_; }
   bool warm() const { return warm_; }
@@ -258,7 +262,8 @@ class Runner {
       return;
     }
     const EngineStats& st = eng_.stats();
-    os << (gateway_mode() ? "venue P&L " : "paper P&L ") << std::setprecision(2) << pnl() << "   fills " << fills_
+    os << (gateway_mode() ? "venue P&L " : "paper P&L ") << std::setprecision(2) << pnl() << " (net of fees paid "
+       << fees_ << ")   fills " << fills_
        << " (hedges " << st.hedge_fills << ")   volume " << std::setprecision(0) << volume_ << "   orders "
        << orders_sent() << "   cancels " << cancels_sent() << std::setprecision(1) << " ("
        << orders_sent() / std::max(1e-9, elapsed_s()) << " orders/s)"
@@ -270,6 +275,8 @@ class Runner {
       if (gate_.ioc_self_cross()) os << "   hedges crossing our own quote " << gate_.ioc_self_cross();
       os << '\n';
     }
+    if (!gateway_mode() && paper_.post_only_rejects())
+      os << "post-only quotes rejected for taking liquidity: " << paper_.post_only_rejects() << '\n';
     if (gateway_mode())
       os << "gateway: venue rejects " << venue_rejects_ << "   unknown reports " << gw_.unknown_reports()
          << "   overfills " << gw_.overfills() << "   book updates held (alone at touch) " << alone_at_touch_ << '\n';
@@ -291,7 +298,7 @@ class Runner {
   }
 
  private:
-  struct Account { double pos = 0.0, cash = 0.0, peak = 0.0; uint64_t fills = 0; };
+  struct Account { double pos = 0.0, cash = 0.0, peak = 0.0, fees = 0.0; uint64_t fills = 0; };
 
   static OrderId parse_id(const std::string& s) { return std::strtoull(s.c_str(), nullptr, 10); }
 
@@ -356,6 +363,10 @@ class Runner {
     a.pos += sgn(f.side) * f.qty;
     a.peak = std::max(a.peak, std::fabs(a.pos));
     a.cash -= sgn(f.side) * f.qty * f.px * mult;
+    const double fee = (f.taker ? taker_fee_[f.inst] : maker_fee_[f.inst]) * f.qty * f.px * mult;
+    a.cash -= fee;
+    a.fees += fee;
+    fees_ += fee;
     ++a.fills;
     ++fills_;
     volume_ += f.qty * f.px * mult;
@@ -379,7 +390,8 @@ class Runner {
   TimeNs now_ = 0, first_ts_ = -1, next_timer_ = 0, next_status_ = 0, next_state_ = 0;
   bool warm_ = false, gw_ready_ = false, loopback_ = false;
   uint64_t events_ = 0, unknown_ = 0, bad_lines_ = 0, fills_ = 0, venue_rejects_ = 0, alone_at_touch_ = 0;
-  double volume_ = 0.0, peak_pnl_ = 0.0, max_dd_ = 0.0;
+  double volume_ = 0.0, peak_pnl_ = 0.0, max_dd_ = 0.0, fees_ = 0.0;
+  std::vector<double> maker_fee_, taker_fee_;
 };
 
 }  // namespace amm::live

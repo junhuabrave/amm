@@ -71,13 +71,13 @@ class GatewayVenue final : public Venue {
   }
   // Fills larger than what is left are capped (and counted): the venue's
   // report wins for position keeping only via the reconciler, not here.
-  bool on_fill(OrderId id, double px, double qty, TimeNs ts, Fill& f) {
+  bool on_fill(OrderId id, double px, double qty, TimeNs ts, Fill& f, bool taker = false) {
     auto it = orders_.find(id);
     if (it == orders_.end()) { ++unknown_; return false; }
     Order& o = it->second;
     if (qty > o.left + 1e-12) ++overfills_;
     o.left -= qty;
-    f = Fill{o.inst, o.side, px, qty, ts, id, o.hedge};
+    f = Fill{o.inst, o.side, px, qty, ts, id, o.hedge, taker || o.ioc};
     return true;
   }
   bool on_done(OrderId id, InstrumentId& inst) {

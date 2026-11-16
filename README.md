@@ -33,7 +33,7 @@ See [docs/DESIGN.md](docs/DESIGN.md) for scope, design and roadmap, and
 
 ```sh
 cmake -S . -B build && cmake --build build     # or: ./build.sh  (g++ >= 11 only)
-./build/amm_tests                              # 46 tests
+./build/amm_tests                              # 47 tests
 python3 feeds/test_feeds.py                    # adapter tests, offline
 python3 feeds/test_trading.py                  # gateway, drop copy, reconciler, offline
 ./build/amm_sim --seeds 24 --duration 1800 --detail
@@ -85,7 +85,10 @@ python3 feeds/synthetic.py --seconds 600 | ./build/amm_run --config config/crypt
   captured from the live Binance and Coinbase endpoints, and live Binance
   perpetual sessions have been recorded over both REST and websockets.
 - Paper P&L understates spread capture (flow that never printed is invisible)
-  and shows adverse selection in full. See [DESIGN.md §11](docs/DESIGN.md).
+  and shows adverse selection in full. Maker and taker fees are charged on
+  every fill and quotes are post-only, as live. On the recorded Binance
+  sessions, at-the-touch quoting loses at the base fee tier and is positive on
+  all of them only with a maker rebate. See [DESIGN.md §11](docs/DESIGN.md).
 
 ## Orders to a venue (Binance USD-M futures)
 

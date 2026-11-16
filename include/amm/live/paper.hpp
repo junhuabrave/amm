@@ -10,8 +10,10 @@
 //     the spread means nobody is ahead.
 //   * If the market quote crosses our resting price, we fill once against
 //     the displayed size at that crossing.
-//   * IOC orders, and resting orders that are marketable on arrival, take
-//     the displayed size at the opposite touch and no more.
+//   * IOC orders take the displayed size at the opposite touch and no more.
+//     A resting order that is marketable on arrival is rejected when
+//     post-only is on (the default, as the gateway sends quotes: Binance
+//     GTX), and otherwise takes the displayed size like an IOC.
 //   * An order and its cancel sent at the same moment arrive in that order:
 //     a cancelled order that is marketable on arrival still fills, as it
 //     would on a real venue. Each processed cancel is confirmed back (the
@@ -35,6 +37,8 @@ class PaperVenue final : public Venue {
   void resize(size_t instruments) { books_.assign(instruments, Book{}); }
   void set_fill_handler(std::function<void(const Fill&)> h) { on_fill_ = std::move(h); }
   void set_cancel_handler(std::function<void(InstrumentId, OrderId)> h) { on_cancel_ = std::move(h); }
+  void set_post_only(bool on) { post_only_ = on; }
+  uint64_t post_only_rejects() const { return post_only_rejects_; }
   uint64_t orders_sent() const { return sent_; }
   uint64_t cancels_sent() const { return cancels_; }
   size_t resting(InstrumentId i) const { return books_[i].orders.size(); }
@@ -122,8 +126,8 @@ class PaperVenue final : public Venue {
   struct Book { TopOfBook top; std::vector<Order> orders; };
   static double eps(double px) { return 1e-9 * std::max(1.0, std::fabs(px)); }
 
-  void emit(const Order& o, double qty, double px) {
-    if (on_fill_ && qty > 0) on_fill_(Fill{o.inst, o.side, px, qty, now_, o.id, o.hedge});
+  void emit(const Order& o, double qty, double px, bool taker = false) {
+    if (on_fill_ && qty > 0) on_fill_(Fill{o.inst, o.side, px, qty, now_, o.id, o.hedge, taker});
   }
   // Fill part of resting order i; returns true if the order was removed.
   bool fill(Book& b, size_t i, double qty, double px) {
@@ -142,10 +146,15 @@ class PaperVenue final : public Venue {
     const bool buy = o.side == Side::Buy;
     const double opp_px = buy ? t.ask : t.bid, opp_sz = buy ? t.ask_sz : t.bid_sz;
     const bool marketable = buy ? o.px >= opp_px - eps(o.px) : o.px <= opp_px + eps(o.px);
+    if (marketable && !o.ioc && post_only_) {  // would take liquidity: the venue rejects it
+      ++post_only_rejects_;
+      if (on_cancel_) on_cancel_(o.inst, o.id);  // done: can no longer fill
+      return;
+    }
     if (marketable) {
       const double q = std::min(o.qty, opp_sz);
       o.qty -= q;
-      emit(o, q, opp_px);  // taker: pays the market's price
+      emit(o, q, opp_px, true);  // taker: pays the market's price and the taker fee
       o.cross_px = opp_px;
     }
     if (o.ioc || o.qty <= 1e-12) return;
@@ -157,7 +166,8 @@ class PaperVenue final : public Venue {
 
   TimeNs latency_, now_ = 0;
   OrderId next_id_ = 0;
-  uint64_t sent_ = 0, cancels_ = 0;
+  uint64_t sent_ = 0, cancels_ = 0, post_only_rejects_ = 0;
+  bool post_only_ = true;
   std::deque<Action> pending_;
   std::vector<Book> books_;
   std::function<void(const Fill&)> on_fill_;

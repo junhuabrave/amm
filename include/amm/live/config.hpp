@@ -6,7 +6,7 @@
 //   [factor NAME]                 level, vol (per sqrt second)
 //   [corr]                        A B = rho
 //   [instrument SYMBOL]           feed, class, protocol, tick, lot, mult, quote_size, max_pos,
-//                                 max_spread, fee, idio_vol, A0, k0, rfq_a0, rfq_b0,
+//                                 max_spread, fee, maker_fee, taker_fee, max_order_qty, idio_vol, A0, k0, rfq_a0, rfq_b0,
 //                                 ref_for, ref_gain, hedges, pricer
 //   pricer = linear FACTOR [a] [b] [l0]
 //          | option SPOT VOL strike expiry_years call|put [ratio] [smile_slope]
@@ -32,11 +32,14 @@ struct InstrumentCfg {
   std::string ref_for, hedges;           // factor names
   std::vector<std::string> pricer;       // tokens of the pricer spec
   double max_order_qty = 0.0;            // pre-trade cap per order; 0 = max_pos
+  double maker_fee = 0.0, taker_fee = 0.0;  // fraction of notional (0.0002 = 2 bp); negative = rebate
 };
 struct LiveConfig {
   EngineConfig engine;
   double paper_latency_s = 0.005;
+  bool paper_post_only = true;  // quotes that would take liquidity on arrival are rejected, as live
   RiskLimits risk;
+  bool fees_in_quotes = true;  // widen each quote by the maker fee (in price terms, at the factor level)
   std::vector<FactorCfg> factors;
   std::vector<CorrCfg> corr;
   std::vector<InstrumentCfg> instruments;
@@ -122,10 +125,12 @@ inline LiveConfig parse_config(std::istream& is, const std::string& name = "conf
       else if (key == "requote_ticks") e.requote_ticks = static_cast<int>(num());
       else if (key == "min_quote_life_ms") e.min_quote_life_s = num() * 1e-3;
       else if (key == "wait_cancel_ack") e.wait_cancel_ack = to_bool(val, where());
+      else if (key == "fees_in_quotes") cfg.fees_in_quotes = to_bool(val, where());
       else if (key == "secs_per_year") e.secs_per_year = num();
       else throw std::runtime_error(where() + ": unknown [engine] key '" + key + "'");
     } else if (kind == "paper") {
       if (key == "latency_ms") cfg.paper_latency_s = num() * 1e-3;
+      else if (key == "post_only") cfg.paper_post_only = to_bool(val, where());
       else throw std::runtime_error(where() + ": unknown [paper] key '" + key + "'");
     } else if (kind == "risk") {
       RiskLimits& r = cfg.risk;
@@ -175,6 +180,8 @@ inline LiveConfig parse_config(std::istream& is, const std::string& name = "conf
       else if (key == "rfq_b0") in.rfq_b0 = num();
       else if (key == "ref_gain") in.ref_gain = num();
       else if (key == "max_order_qty") ic.max_order_qty = num();
+      else if (key == "maker_fee") ic.maker_fee = num();
+      else if (key == "taker_fee") ic.taker_fee = num();
       else if (key == "ref_for") ic.ref_for = val;
       else if (key == "hedges") ic.hedges = val;
       else if (key == "pricer") ic.pricer = split_ws(val);
@@ -268,6 +275,12 @@ inline void build_engine(const LiveConfig& cfg, Engine& eng) {
   for (const auto& ic : cfg.instruments) {
     Instrument in = ic.in;
     const std::string ctx = "instrument " + in.symbol;
+    if (cfg.fees_in_quotes && ic.maker_fee > 0.0 && !ic.ref_for.empty()) {
+      // the engine's fee is per unit in price terms; value the rate at the factor level.
+      // A rebate (negative fee) is not used to tighten quotes: it would pull them through the touch.
+      const double level = eng.factors().level(factor(ic.ref_for, ctx));
+      in.fee += ic.maker_fee * level;
+    }
     if (!(in.tick > 0 && in.lot > 0 && in.mult > 0 && in.quote_size > 0 && in.max_pos > 0))
       throw std::runtime_error(ctx + ": tick, lot, mult, quote_size and max_pos must all be > 0");
     if (!(in.A0 > 0 && in.k0 > 0)) throw std::runtime_error(ctx + ": A0 and k0 must be > 0");

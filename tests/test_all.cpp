@@ -6,6 +6,8 @@
 #include <vector>
 
 #include <fstream>
+#include <iterator>
+#include <memory>
 #include <sstream>
 
 #include "amm/live/calibrate.hpp"
@@ -728,14 +730,19 @@ static std::string flicker_stream(int bursts) {
 
 TEST(runner_respects_position_limit_when_quotes_flicker) {
   const LiveConfig cfg = load_config(std::string(AMM_SOURCE_DIR) + "/config/binance_perp.ini");
+  // Harshest setting first: quotes may take liquidity on arrival and are
+  // replaced without waiting for cancel acks (how the breach was found);
+  // then the shipped defaults (post-only, wait for acks).
+  for (int harsh : {1, 0})
   for (double life : {0.0, 0.25}) {
     LiveConfig c = cfg;
     c.engine.min_quote_life_s = life;
     c.engine.hedge_band = 1e12;  // no hedger: the quotes alone must respect the limit
+    if (harsh) { c.paper_post_only = false; c.engine.wait_cancel_ack = false; }
     std::istringstream in(flicker_stream(40));
     Runner r(c, RunnerOptions{});
     r.run(in);
-    CHECK(r.warm() && r.fills() > 10);
+    CHECK(r.warm() && (!harsh || r.fills() > 10));
     for (size_t i = 0; i < r.engine().instruments(); ++i)
       CHECK(r.peak_position(i) <= r.engine().instrument(i).max_pos + 1e-9);
   }
@@ -1109,6 +1116,46 @@ TEST(kill_file_stops_trading) {
   ev(t() + ",B,BINANCE-PERP:ETHUSDT,1800,10,1800.01,10");
   CHECK(r.gate().killed() && r.gate().kill_reason().find("kill file") == 0);
   std::remove(kf.c_str());
+}
+
+TEST(fees_are_charged_and_widen_quotes) {
+  std::ifstream cf(std::string(AMM_SOURCE_DIR) + "/config/binance_perp.ini");
+  const std::string base((std::istreambuf_iterator<char>(cf)), std::istreambuf_iterator<char>());
+  auto cfg_with = [&](const std::string& maker, bool in_quotes) {
+    std::string t = set_ini_value(base, "instrument:*", "maker_fee", maker);
+    t = set_ini_value(t, "instrument:*", "taker_fee", "0.0005");
+    t = set_ini_value(t, "engine", "fees_in_quotes", in_quotes ? "true" : "false");
+    std::istringstream is(t);
+    return parse_config(is);
+  };
+  const std::string BTC = "BINANCE-PERP:BTCUSDT", ETH = "BINANCE-PERP:ETHUSDT";
+  auto session = [&](const LiveConfig& cfg, std::ostringstream& orders) {
+    RunnerOptions opt;
+    opt.orders = &orders;
+    auto r = std::make_unique<Runner>(cfg, opt);
+    MdEvent e;
+    for (const std::string& l : {std::string("1,G,ready"), "2,B," + BTC + ",65000,1,65000.1,1", "3,B," + ETH + ",1800,10,1800.01,10"}) {
+      CHECK(parse_event(l, e));
+      r->on_event(e);
+    }
+    return r;
+  };
+  std::ostringstream o1, o2;
+  auto r = session(cfg_with("0.0002", true), o1);
+  auto bare = session(cfg_with("0.0002", false), o2);
+  // a maker fill and a taker fill of 0.002 BTC at 65000: 130 notional each
+  OrderId bid = 0, ask = 0;
+  for (const auto& [oid, o] : r->gateway().orders())
+    if (o.inst == 0) (o.side == Side::Buy ? bid : ask) = oid;
+  CHECK(bid && ask);
+  MdEvent e;
+  CHECK(parse_event("4,F," + std::to_string(bid) + ",65000,0.002,M", e)); r->on_event(e);
+  CHECK(parse_event("5,F," + std::to_string(ask) + ",65000,0.002,T", e)); r->on_event(e);
+  NEAR(r->fees(), 130 * 0.0002 + 130 * 0.0005, 1e-9);
+  NEAR(r->inst_pnl(0), -r->fees(), 1e-6);  // bought and sold at 65000: flat, down the fees
+  // with the fee in the quotes, both sides sit further from the market
+  const Quote q_bare = bare->engine().make_quote(0), q_fee = r->engine().make_quote(0);
+  CHECK(q_fee.half > q_bare.half + 0.5 * 0.0002 * 64000);
 }
 
 int main(int argc, char** argv) {
