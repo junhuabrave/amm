@@ -13,6 +13,7 @@
 #include "amm/live/config.hpp"
 #include "amm/live/events.hpp"
 #include "amm/live/paper.hpp"
+#include "amm/live/risk_gate.hpp"
 
 namespace amm::live {
 
@@ -27,10 +28,16 @@ struct RunnerOptions {
 class Runner {
  public:
   Runner(const LiveConfig& cfg, RunnerOptions opt)
-      : opt_(opt), paper_(cfg.paper_latency_s), eng_(cfg.engine, &paper_) {
+      : opt_(opt), paper_(cfg.paper_latency_s), gate_(&paper_, cfg.risk), eng_(cfg.engine, &gate_) {
     build_engine(cfg, eng_);
     const size_t n = eng_.instruments();
     paper_.resize(n);
+    std::vector<double> maxq(n), mult(n);
+    for (size_t i = 0; i < n; ++i) {
+      maxq[i] = cfg.instruments[i].max_order_qty > 0 ? cfg.instruments[i].max_order_qty : cfg.instruments[i].in.max_pos;
+      mult[i] = cfg.instruments[i].in.mult;
+    }
+    gate_.resize(n, maxq, mult);
     tops_.assign(n, TopOfBook{});
     acct_.assign(n, Account{});
     for (size_t i = 0; i < n; ++i) {
@@ -39,7 +46,10 @@ class Runner {
       by_feed_[cfg.instruments[i].feed] = static_cast<InstrumentId>(i);
     }
     paper_.set_fill_handler([this](const Fill& f) { on_fill(f); });
-    paper_.set_cancel_handler([this](InstrumentId i, OrderId o) { if (warm_) eng_.on_cancel_done(i, o); });
+    paper_.set_cancel_handler([this](InstrumentId i, OrderId o) {
+      gate_.on_done(o);
+      if (warm_) eng_.on_cancel_done(i, o);
+    });
   }
 
   void run(std::istream& in) {
@@ -59,11 +69,13 @@ class Runner {
     if (first_ts_ < 0) first_ts_ = ev.ts;
     now_ = std::max(now_, ev.ts);
     ++events_;
+    gate_.set_time(now_);
     if (warm_) paper_.on_time(now_);
     switch (ev.type) {
       case 'B': {
         TopOfBook t{ev.a, ev.c, ev.b, ev.d, now_};
         tops_[id] = t;
+        gate_.set_reference(id, t.mid());
         if (!warm_) { try_start(); break; }
         paper_.on_book(id, t);  // the market may run over our resting quotes first
         eng_.on_book(id, t);
@@ -79,6 +91,7 @@ class Runner {
       default: break;
     }
     if (!warm_) return;
+    if (eng_.halted() && !gate_.killed()) gate_.kill("engine loss limit");
     if (now_ >= next_timer_) {
       eng_.on_timer(now_);
       next_timer_ = now_ + ns(opt_.timer_s);
@@ -112,6 +125,8 @@ class Runner {
   bool warm() const { return warm_; }
   double elapsed_s() const { return first_ts_ < 0 ? 0.0 : secs(now_ - first_ts_); }
   Engine& engine() { return eng_; }
+  RiskGate& gate() { return gate_; }
+  const RiskGate& gate() const { return gate_; }
   const PaperVenue& venue() const { return paper_; }
 
   void status(std::ostream& os) const {
@@ -133,7 +148,15 @@ class Runner {
     os << "paper P&L " << std::setprecision(2) << pnl() << "   fills " << fills_ << " (hedges " << st.hedge_fills
        << ")   volume " << std::setprecision(0) << volume_ << "   orders " << paper_.orders_sent() << "   cancels "
        << paper_.cancels_sent() << std::setprecision(1) << " (" << paper_.orders_sent() / std::max(1e-9, elapsed_s())
-       << " orders/s)" << (eng_.halted() ? "   KILL SWITCH FIRED" : "") << "\n\n";
+       << " orders/s)" << (eng_.halted() ? "   KILL SWITCH FIRED" : "") << '\n';
+    if (gate_.rejected_total() || gate_.ioc_self_cross()) {
+      os << "pre-trade refusals:";
+      for (int r = 1; r < static_cast<int>(Reject::Count); ++r)
+        if (gate_.rejected(static_cast<Reject>(r))) os << ' ' << reject_name(static_cast<Reject>(r)) << ' ' << gate_.rejected(static_cast<Reject>(r));
+      if (gate_.ioc_self_cross()) os << "   hedges crossing our own quote " << gate_.ioc_self_cross();
+      os << '\n';
+    }
+    os << '\n';
     os << std::left << std::setw(22) << "instrument" << std::right << std::setw(12) << "position" << std::setw(12) << "peak |pos|" << std::setw(8)
        << "fills" << std::setw(14) << "P&L" << std::setw(14) << "mkt bid" << std::setw(14) << "mkt ask"
        << std::setw(14) << "our bid" << std::setw(14) << "our ask" << '\n';
@@ -177,6 +200,7 @@ class Runner {
   }
 
   void on_fill(const Fill& f) {
+    gate_.on_fill(f.oid, f.qty);
     Account& a = acct_[f.inst];
     const double mult = eng_.instrument(f.inst).mult;
     a.pos += sgn(f.side) * f.qty;
@@ -193,6 +217,7 @@ class Runner {
 
   RunnerOptions opt_;
   PaperVenue paper_;
+  RiskGate gate_;
   Engine eng_;
   std::map<std::string, InstrumentId> by_feed_;
   std::map<InstrumentId, double> pending_composite_;

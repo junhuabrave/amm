@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "amm/engine.hpp"
+#include "amm/live/risk_gate.hpp"
 
 namespace amm::live {
 
@@ -30,10 +31,12 @@ struct InstrumentCfg {
   std::string feed;                      // symbol as the venue adapter emits it
   std::string ref_for, hedges;           // factor names
   std::vector<std::string> pricer;       // tokens of the pricer spec
+  double max_order_qty = 0.0;            // pre-trade cap per order; 0 = max_pos
 };
 struct LiveConfig {
   EngineConfig engine;
   double paper_latency_s = 0.005;
+  RiskLimits risk;
   std::vector<FactorCfg> factors;
   std::vector<CorrCfg> corr;
   std::vector<InstrumentCfg> instruments;
@@ -91,7 +94,7 @@ inline LiveConfig parse_config(std::istream& is, const std::string& name = "conf
         ic.in.symbol = arg;
         ic.feed = arg;
         cfg.instruments.push_back(ic);
-      } else if (kind != "engine" && kind != "paper" && kind != "corr") {
+      } else if (kind != "engine" && kind != "paper" && kind != "corr" && kind != "risk") {
         throw std::runtime_error(where() + ": unknown section [" + kind + "]");
       }
       continue;
@@ -118,11 +121,20 @@ inline LiveConfig parse_config(std::istream& is, const std::string& name = "conf
       else if (key == "max_loss") e.max_loss = num();
       else if (key == "requote_ticks") e.requote_ticks = static_cast<int>(num());
       else if (key == "min_quote_life_ms") e.min_quote_life_s = num() * 1e-3;
+      else if (key == "wait_cancel_ack") e.wait_cancel_ack = to_bool(val, where());
       else if (key == "secs_per_year") e.secs_per_year = num();
       else throw std::runtime_error(where() + ": unknown [engine] key '" + key + "'");
     } else if (kind == "paper") {
       if (key == "latency_ms") cfg.paper_latency_s = num() * 1e-3;
       else throw std::runtime_error(where() + ": unknown [paper] key '" + key + "'");
+    } else if (kind == "risk") {
+      RiskLimits& r = cfg.risk;
+      if (key == "collar_bps") r.collar_bps = num();
+      else if (key == "max_order_notional") r.max_order_notional = num();
+      else if (key == "max_orders_per_s") r.max_orders_per_s = num();
+      else if (key == "burst") r.burst = num();
+      else if (key == "max_open") r.max_open = static_cast<int>(num());
+      else throw std::runtime_error(where() + ": unknown [risk] key '" + key + "'");
     } else if (kind == "factor") {
       FactorCfg& f = cfg.factors.back();
       if (key == "level") f.level = num();
@@ -162,6 +174,7 @@ inline LiveConfig parse_config(std::istream& is, const std::string& name = "conf
       else if (key == "rfq_a0") in.rfq_a0 = num();
       else if (key == "rfq_b0") in.rfq_b0 = num();
       else if (key == "ref_gain") in.ref_gain = num();
+      else if (key == "max_order_qty") ic.max_order_qty = num();
       else if (key == "ref_for") ic.ref_for = val;
       else if (key == "hedges") ic.hedges = val;
       else if (key == "pricer") ic.pricer = split_ws(val);

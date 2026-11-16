@@ -8,6 +8,7 @@
 #include <sstream>
 
 #include "amm/live/calibrate.hpp"
+#include "amm/live/risk_gate.hpp"
 #include "amm/live/runner.hpp"
 #include "amm/sim/scenario.hpp"
 
@@ -33,7 +34,9 @@ struct Rec {
 struct RecVenue final : Venue {
   std::vector<Rec> orders;
   OrderId next = 0;
+  bool refuse = false;  // act as a risk gate that refuses everything
   OrderId submit(InstrumentId i, Side s, double px, double qty, bool ioc, bool hedge) override {
+    if (refuse) return 0;
     orders.push_back(Rec{i, s, px, qty, ioc, hedge, ++next, !ioc});
     return next;
   }
@@ -902,6 +905,99 @@ TEST(sweep_overrides_config_keys_by_section) {
   bool threw = false;
   try { set_ini_value(base, "instrument:C", "tick", "1"); } catch (const std::runtime_error&) { threw = true; }
   CHECK(threw);  // a typo must not silently sweep nothing
+}
+
+TEST(risk_gate_refuses_what_it_should_and_passes_cancels) {
+  RecVenue v;
+  RiskLimits lim;
+  lim.collar_bps = 100; lim.max_orders_per_s = 2; lim.burst = 3; lim.max_open = 2; lim.max_order_notional = 1000;
+  RiskGate g(&v, lim);
+  g.resize(2, {5.0, 0.0}, {1.0, 1.0});
+  g.set_time(ns(1.0));
+  CHECK(g.submit(0, Side::Buy, 99, 1, false, false) == 0);  // no reference price yet
+  CHECK(g.rejected(Reject::NoReference) == 1);
+  g.set_reference(0, 100.0);
+  g.set_reference(1, 100.0);
+  CHECK(g.submit(0, Side::Buy, 98.9, 1, false, false) == 0);  // 110 bp away
+  CHECK(g.rejected(Reject::Collar) == 1);
+  CHECK(g.submit(0, Side::Buy, 99.5, 6, false, false) == 0);  // above max_order_qty 5
+  CHECK(g.submit(1, Side::Buy, 99.5, 11, false, false) == 0);  // 1094.5 > max_order_notional
+  CHECK(g.rejected(Reject::Size) == 2);
+  const OrderId b1 = g.submit(0, Side::Buy, 99.5, 1, false, false);
+  const OrderId a1 = g.submit(0, Side::Sell, 100.5, 1, false, false);
+  CHECK(b1 && a1 && g.open(0) == 2);
+  CHECK(g.submit(0, Side::Buy, 99.4, 1, false, false) == 0);  // third resting order
+  CHECK(g.rejected(Reject::Open) == 1);
+  g.on_fill(b1, 0.4);
+  CHECK(g.open(0) == 2);  // partly filled: still resting
+  g.on_fill(b1, 0.6);
+  CHECK(g.open(0) == 1);
+  CHECK(g.submit(0, Side::Buy, 100.6, 1, false, false) == 0);  // would trade with our own offer
+  CHECK(g.rejected(Reject::SelfTrade) == 1);
+  // burst of 3 used up (two orders and one more below); refill at 2/s
+  CHECK(g.submit(1, Side::Buy, 99.5, 1, true, false) != 0);
+  CHECK(g.submit(1, Side::Buy, 99.5, 1, true, false) == 0);
+  CHECK(g.rejected(Reject::Rate) == 1);
+  g.set_time(ns(1.6));
+  CHECK(g.submit(1, Side::Buy, 99.5, 1, true, false) != 0);
+  CHECK(g.submit(0, Side::Buy, 100.6, 1, true, true) == 0);   // tokens gone again
+  g.set_time(ns(3.0));
+  CHECK(g.submit(0, Side::Buy, 100.6, 1, true, true) != 0);   // an IOC hedge may cross our offer...
+  CHECK(g.ioc_self_cross() == 1);                              // ...and is counted
+  const size_t sent = v.orders.size();
+  g.kill("test");
+  CHECK(g.submit(0, Side::Buy, 99.5, 1, false, false) == 0 && g.rejected(Reject::Killed) == 1);
+  g.cancel(0, a1);  // cancels always pass
+  CHECK(v.orders.size() == sent && !v.orders[1].live);
+  g.on_done(a1);
+  CHECK(g.open(0) == 0);
+}
+
+TEST(engine_handles_refused_orders_and_orders_the_venue_drops) {
+  EngineConfig c = mode_config(Mode::Unified);
+  c.hedge_band = 1e12; c.risk_limit = 1e12;
+  Full f(c);
+  const InstrumentId s = f.id.stock;
+  const double tick = f.u.insts[s].in.tick, half = f.u.insts[s].bg_half;
+  const double fv = f.e.fair(s);
+  // The venue (a risk gate) refuses: the engine must not believe it is quoting.
+  const Rec* bid = f.v.live(s, Side::Buy);
+  CHECK(bid != nullptr);
+  const OrderId old_bid = bid->id;
+  f.v.refuse = true;
+  f.e.on_book(s, book(fv - 20 * tick, half, tick, f.ts += 1000));  // old bid now too high: cancelled
+  CHECK(f.e.stats().refused > 0);
+  f.v.refuse = false;
+  f.e.on_book(s, book(fv - 20 * tick, half, tick, f.ts += 1000));
+  const Rec* nb = f.v.live(s, Side::Buy);
+  CHECK(nb && nb->id != old_bid);  // retried once the gate let it through
+  // The venue expires or rejects a resting quote on its own: requote.
+  const OrderId gone = nb->id;
+  f.v.orders.back().live = false;
+  for (auto& o : f.v.orders) if (o.id == gone) o.live = false;
+  f.e.on_cancel_done(s, gone);
+  const Rec* again = f.v.live(s, Side::Buy);
+  CHECK(again && again->id != gone);
+}
+
+TEST(one_order_in_flight_per_side_when_waiting_for_cancel_acks) {
+  EngineConfig c = mode_config(Mode::Unified);
+  c.hedge_band = 1e12; c.risk_limit = 1e12; c.wait_cancel_ack = true;
+  Full f(c);
+  const InstrumentId s = f.id.stock;
+  const double tick = f.u.insts[s].in.tick, half = f.u.insts[s].bg_half;
+  const double fv = f.e.fair(s);
+  const Rec* bid = f.v.live(s, Side::Buy);
+  CHECK(bid != nullptr);
+  const OrderId first = bid->id;
+  f.e.on_book(s, book(fv - 20 * tick, half, tick, f.ts += 1000));  // bid must go
+  CHECK(f.v.live(s, Side::Buy) == nullptr);                          // cancelled, not replaced yet
+  CHECK(f.e.closing(s, Side::Buy) > 0);
+  f.e.on_book(s, book(fv - 25 * tick, half, tick, f.ts += 1000));
+  CHECK(f.v.live(s, Side::Buy) == nullptr);                          // still waiting
+  f.e.on_cancel_done(s, first);
+  const Rec* nb = f.v.live(s, Side::Buy);
+  CHECK(nb && nb->id != first);                                      // replaced on the ack
 }
 
 int main(int argc, char** argv) {

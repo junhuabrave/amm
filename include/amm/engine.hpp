@@ -36,12 +36,14 @@ struct EngineConfig {
   double risk_limit = 400.0;      // portfolio st.dev (currency / sqrt s): beyond it only reduce
   double max_loss = 1e9;          // kill switch on mark-to-fair P&L
   int requote_ticks = 1;          // price change that forces a cancel/replace
+  bool wait_cancel_ack = false;   // no new order on a side while a cancel there is unconfirmed
   double min_quote_life_s = 0.0;  // a younger quote is kept unless it must go (see reconcile)
   double secs_per_year = 252.0 * 6.5 * 3600.0;
 };
 
 struct EngineStats {
   uint64_t book_events = 0, fills = 0, hedge_fills = 0, orders = 0, cancels = 0;
+  uint64_t refused = 0;       // quotes the venue (or a risk gate in front of it) refused to send
   uint64_t rfq_seen = 0, rfq_quoted = 0, rfq_won = 0;
   double spread_pnl = 0.0;   // edge vs fair captured on quote fills
   double hedge_pnl = 0.0;    // edge vs fair paid on hedges (negative)
@@ -128,10 +130,18 @@ class Engine {
     s.dirty = true;
   }
 
-  // The venue confirms that a cancel took effect (or that the order was
-  // already gone). Until then a cancelled order can still fill, so its
-  // remaining size counts against the position limit.
+  // The venue reports that an order can no longer fill: a cancel took effect,
+  // or the venue cancelled, expired or rejected it on its own. Until a
+  // cancel is confirmed the order can still fill, so its remaining size
+  // counts against the position limit.
   void on_cancel_done(InstrumentId id, OrderId oid) {
+    for (Live* l : {&st_[id].bid, &st_[id].ask})
+      if (l->id == oid && oid != 0) {  // not cancelled by us: the quote is simply gone
+        *l = Live{};
+        st_[id].dirty = true;
+        flush();
+        return;
+      }
     for (size_t k = 0; k < closing_.size(); ++k)
       if (closing_[k].id == oid) {
         State& s = st_[closing_[k].inst];
@@ -518,10 +528,14 @@ class Engine {
     // just above) is counted as filled.
     const double room = side == Side::Buy ? in.max_pos - s.pos - s.closing_bid : in.max_pos + s.pos - s.closing_ask;
     qty = floor_to(std::min(qty, room), in.lot);
+    if (cfg_.wait_cancel_ack && on && !l.id)  // one order in flight per side: replace once the cancel lands
+      for (const Closing& c : closing_)
+        if (c.inst == id && c.side == side) return;
     if (on && !l.id && qty >= in.lot) {
-      l.id = venue_->submit(id, side, px, qty, false, false);
-      l.px = px; l.qty = qty; l.ts = now_;
+      const OrderId oid = venue_->submit(id, side, px, qty, false, false);
       ++stats_.orders;
+      if (oid) { l.id = oid; l.px = px; l.qty = qty; l.ts = now_; }  // 0: refused before sending
+      else ++stats_.refused;
     }
   }
 
