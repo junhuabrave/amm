@@ -130,6 +130,16 @@ class Engine {
     s.dirty = true;
   }
 
+  // Take over a position that exists at the venue (a restart, or one opened
+  // outside this session), valued at `px`: P&L counts from here.
+  void seed_position(InstrumentId id, double qty, double px) {
+    State& s = st_[id];
+    cash_ -= (qty - s.pos) * px * inst_[id].mult;
+    s.pos = qty;
+    refresh_risk();
+    for (auto& x : st_) x.dirty = true;
+  }
+
   // The venue reports that an order can no longer fill: a cancel took effect,
   // or the venue cancelled, expired or rejected it on its own. Until a
   // cancel is confirmed the order can still fill, so its remaining size

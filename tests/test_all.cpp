@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include <fstream>
 #include <sstream>
 
 #include "amm/live/calibrate.hpp"
@@ -998,6 +999,105 @@ TEST(one_order_in_flight_per_side_when_waiting_for_cancel_acks) {
   f.e.on_cancel_done(s, first);
   const Rec* nb = f.v.live(s, Side::Buy);
   CHECK(nb && nb->id != first);                                      // replaced on the ack
+}
+
+// Order lines the runner sent to the gateway, parsed: {type, id, symbol, side, px, qty, tif}.
+static std::vector<std::vector<std::string>> order_lines(const std::string& text) {
+  std::vector<std::vector<std::string>> out;
+  std::istringstream is(text);
+  for (std::string l; std::getline(is, l);) {
+    std::vector<std::string> f;
+    std::stringstream ls(l);
+    for (std::string x; std::getline(ls, x, ',');) f.push_back(x);
+    out.push_back(f);
+  }
+  return out;
+}
+
+TEST(gateway_mode_round_trip) {
+  LiveConfig cfg = load_config(std::string(AMM_SOURCE_DIR) + "/config/binance_perp.ini");
+  std::ostringstream orders, state, log;
+  RunnerOptions opt;
+  opt.orders = &orders; opt.state = &state; opt.log = &log;
+  opt.kill_file = std::string(AMM_SOURCE_DIR) + "/build/test_kill_file_that_does_not_exist";
+  Runner r(cfg, opt);
+  const std::string BTC = "BINANCE-PERP:BTCUSDT", ETH = "BINANCE-PERP:ETHUSDT";
+  TimeNs ts = ns(1000.0);
+  auto ev = [&](const std::string& line) { MdEvent e; CHECK(parse_event(line, e)); r.on_event(e); };
+  auto t = [&](double dt = 0.01) { ts += ns(dt); return std::to_string(ts); };
+  ev(t() + ",B," + BTC + ",65000,1,65000.1,1");
+  ev(t() + ",B," + ETH + ",1800,10,1800.01,10");
+  CHECK(!r.warm() && orders.str().empty());  // books alone are not enough: gateway not ready
+  ev(t() + ",P," + ETH + ",0.5");           // the venue already holds 0.5 ETH
+  ev(t() + ",G,ready");
+  CHECK(r.warm());
+  CHECK(std::fabs(r.position(1) - 0.5) < 1e-12);
+  CHECK(std::fabs(r.engine().position(1) - 0.5) < 1e-12);
+  auto lines = order_lines(orders.str());
+  CHECK(lines.size() >= 2);
+  std::string bid_id;
+  for (const auto& f : lines) {
+    CHECK(f.size() == 7 && f[0] == "N" && (f[6] == "POST" || f[6] == "IOC"));
+    if (f[2] == BTC && f[3] == "B") bid_id = f[1];
+  }
+  CHECK(!bid_id.empty());
+  // accepted, then filled in part: position moves, the order still rests
+  ev(t() + ",A," + bid_id);
+  double bid_px = 0;
+  for (const auto& f : lines) if (f[1] == bid_id) bid_px = std::stod(f[4]);
+  ev(t() + ",F," + bid_id + "," + std::to_string(bid_px) + ",0.002");
+  CHECK(std::fabs(r.position(0) - 0.002) < 1e-12);
+  CHECK(std::fabs(r.engine().position(0) - 0.002) < 1e-12);
+  // our own resting size is taken out of the displayed book
+  CHECK(r.gateway().own_at(0, Side::Buy, bid_px) > 0);
+  // the venue drops it on its own: the engine requotes
+  const size_t before = order_lines(orders.str()).size();
+  ev(t() + ",D," + bid_id + ",expired");
+  ev(t() + ",B," + BTC + ",65000,1,65000.1,1");
+  CHECK(order_lines(orders.str()).size() > before);
+  // reports for ids we never sent are counted, not acted on
+  ev(t() + ",F,999999,65000,1");
+  CHECK(r.gateway().unknown_reports() == 1 && std::fabs(r.position(0) - 0.002) < 1e-12);
+  // state snapshots for the reconciler
+  for (int k = 0; k < 20; ++k) ev(t(0.1) + ",B," + ETH + ",1800,10,1800.01,10");
+  CHECK(state.str().find("\"positions\":{\"BTC-USDT-PERP\":0.002,\"ETH-USDT-PERP\":0.5}") != std::string::npos);
+  CHECK(state.str().find("\"killed\":false") != std::string::npos);
+  // the venue reports a position we do not hold: stop, cancel everything
+  ev(t() + ",P," + BTC + ",0.05");
+  CHECK(r.gate().killed());
+  auto all = order_lines(orders.str());
+  CHECK(!all.empty() && all.back()[0] == "K");
+  bool cancels = false;
+  for (const auto& f : all) if (f[0] == "X") cancels = true;
+  CHECK(cancels);
+  const size_t after_kill = all.size();
+  for (int k = 0; k < 5; ++k) ev(t(0.2) + ",B," + BTC + ",64990,1,64990.1,1");
+  size_t news = 0;
+  auto again = order_lines(orders.str());
+  for (size_t k = after_kill; k < again.size(); ++k) if (again[k][0] == "N") ++news;
+  CHECK(news == 0);  // nothing new after the kill
+  CHECK(log.str().find("KILL: position mismatch") != std::string::npos);
+}
+
+TEST(kill_file_stops_trading) {
+  LiveConfig cfg = load_config(std::string(AMM_SOURCE_DIR) + "/config/binance_perp.ini");
+  const std::string kf = std::string(AMM_SOURCE_DIR) + "/build/test_kill_file";
+  std::remove(kf.c_str());
+  std::ostringstream orders;
+  RunnerOptions opt;
+  opt.orders = &orders; opt.kill_file = kf;
+  Runner r(cfg, opt);
+  TimeNs ts = ns(1000.0);
+  auto ev = [&](const std::string& line) { MdEvent e; CHECK(parse_event(line, e)); r.on_event(e); };
+  auto t = [&]() { ts += ns(0.2); return std::to_string(ts); };
+  ev(t() + ",G,ready");
+  ev(t() + ",B,BINANCE-PERP:BTCUSDT,65000,1,65000.1,1");
+  ev(t() + ",B,BINANCE-PERP:ETHUSDT,1800,10,1800.01,10");
+  CHECK(r.warm() && !r.gate().killed());
+  { std::ofstream f(kf); f << "stop\n"; }
+  ev(t() + ",B,BINANCE-PERP:ETHUSDT,1800,10,1800.01,10");
+  CHECK(r.gate().killed() && r.gate().kill_reason().find("kill file") == 0);
+  std::remove(kf.c_str());
 }
 
 int main(int argc, char** argv) {
