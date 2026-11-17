@@ -1194,6 +1194,66 @@ TEST(reference_markets_are_watched_not_quoted_and_leaders_move_fair_value) {
   NEAR(e.fair(fq), 50.5, 0.02);
 }
 
+TEST(momentum_lead_from_another_market_shifts_fair_value_and_fades) {
+  // F's perp follows a reference market's recent move (momentum), not its level.
+  EngineConfig c;
+  c.hedge_band = 1e12; c.risk_limit = 1e12;
+  RecVenue v;
+  Engine e(c, &v);
+  const FactorId L = e.factors().add("L", 100.0, 0.01), F = e.factors().add("F", 100.0, 0.01);
+  auto inst = [&](FactorId f, bool quote, InstrumentId leader) {
+    Instrument in;
+    in.symbol = quote ? "q" : "ref";
+    in.cls = AssetClass::CryptoPerp; in.tick = 0.01; in.lot = 0.01; in.quote_size = 1; in.max_pos = 10;
+    in.A0 = 1; in.k0 = 10; in.quote = quote;
+    in.ref_for_factor = f;
+    in.pricer = e.add_pricer(std::make_unique<LinearPricer>(f));
+    if (leader != kNoInstrument) {
+      in.lead_inst = leader; in.lead_momentum = true; in.lead_tau_s = 0.1; in.lead_gain = 0.5;
+    }
+    return e.add_instrument(in);
+  };
+  const InstrumentId ref = inst(L, false, kNoInstrument), q = inst(F, true, ref);
+  TimeNs ts = ns(1.0);
+  e.start(ts);
+  auto bk = [&](InstrumentId i, double mid) { e.on_book(i, TopOfBook{mid - 0.01, mid + 0.01, 5, 5, ts += ns(0.01)}); };
+  for (int k = 0; k < 300; ++k) { bk(ref, 100.0); bk(q, 100.0); }
+  const double f0 = e.fair(q);
+  NEAR(f0, 100.0, 0.01);
+  // after a long quiet spell the leader jumps 1%: fair moves by about gain * 1% at once
+  ts += ns(5.0);
+  bk(ref, 101.0);
+  NEAR(e.fair(q) - f0, 0.5, 0.05);
+  // the leader stays put: its move is no longer recent, the term fades,
+  // although this market never followed (unlike the gap shape)
+  for (int k = 0; k < 100; ++k) { bk(ref, 101.0); bk(q, 100.0); }
+  NEAR(e.fair(q), 100.0, 0.01);
+}
+
+TEST(config_lead_names_an_instrument_or_a_factor) {
+  const std::string text =
+      "[factor A]\nlevel = 100\nvol = 0.01\n"
+      "[instrument SPOT]\nclass = crypto_spot\ntick = 0.01\nlot = 0.01\nquote = false\nA0 = 1\nk0 = 10\n"
+      "ref_for = A\npricer = linear A\n"
+      "[instrument PERP]\nclass = crypto_perp\ntick = 0.01\nlot = 0.01\nquote_size = 1\nmax_pos = 5\n"
+      "A0 = 1\nk0 = 10\nref_for = A\npricer = linear A\nlead = SPOT\nlead_mode = momentum\n"
+      "lead_tau_ms = 100\nlead_gain = 0.5\n";
+  std::istringstream in(text);
+  const auto cfg = amm::live::parse_config(in, "t");
+  CHECK(cfg.instruments[1].in.lead_momentum);
+  RecVenue v;
+  Engine e(cfg.engine, &v);
+  amm::live::build_engine(cfg, e);
+  CHECK(e.instrument(1).lead_inst == 0);
+  CHECK(e.instrument(1).lead_factor == kNoFactor);
+  bool threw = false;
+  try {
+    std::istringstream bad(text + "lead_mode = sideways\n");
+    amm::live::parse_config(bad, "t");
+  } catch (const std::exception&) { threw = true; }
+  CHECK(threw);
+}
+
 int main(int argc, char** argv) {
   const std::string filter = argc > 1 ? argv[1] : "";
   int ran = 0;

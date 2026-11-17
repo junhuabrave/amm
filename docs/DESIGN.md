@@ -150,13 +150,22 @@ fair = model(factor levels) + basis
   move their factor and keep a basis, but are never quoted. Several markets
   can observe one factor (a perpetual and its spot market); the latest to
   move pulls the factor, and each keeps its own basis.
-- **Lead-lag between factors** (`lead`, `lead_beta`, `lead_tau_ms`,
+- **Lead-lag** (`lead`, `lead_mode`, `lead_beta`, `lead_tau_ms`,
   `lead_gain`, off by default). Correlation between factors enters risk, not
-  fair value: a move in one factor does not move another's level. For a
-  follower market, the engine tracks `x = ln(mid) - beta * ln(leader level)`
-  against its average over `tau`, and adds `mid * (exp(-gain * (x - avg)) - 1)`
-  to fair value: when the leader has moved and the follower has not, its fair
-  value moves first. Measured on Binance it did not help (section 11).
+  fair value: a move in one factor does not move another's level. A follower
+  market names a leader, either a factor (its level) or another instrument
+  (its mid, e.g. a perpetual following its spot market), and one of two shapes:
+  - `gap`: the engine tracks `x = ln(mid) - beta * ln(leader)` against its
+    average over `tau` and adds `mid * (exp(-gain * (x - avg)) - 1)` to fair
+    value: when the leader has moved and the follower has not, its fair value
+    moves first.
+  - `momentum`: `x = beta * ln(leader)` against its average over `tau`, and
+    `mid * (exp(gain * (x - avg)) - 1)`: the leader's own recent move predicts
+    the follower's next one, whether or not the follower has started to move.
+  The average treats the series as piecewise constant (it held its previous
+  value since the last update), so a jump after a quiet spell counts in full.
+  On Binance the gap shape did not help; the momentum shape from spot carries
+  a small real signal (section 11).
 
 ## 5. Quoting on order books
 
@@ -579,24 +588,55 @@ so by default it does not quote where it cannot pay the fee; set your own
 tier's rates (and `fees_in_quotes = false` with a rebate) to quote at the
 touch.
 
-**Cross-asset fair value on real data: no usable lead found so far.** The
-simulator's largest gain over a single-instrument quoter comes from fair
-value that moves before an instrument's own market. `feeds/leadlag.py`
-measures whether that exists between real markets, in receipt time (what the
-engine sees). BTC and ETH perpetuals, 4 hours, 50 ms grid: most of the
-co-movement is in the same 50 ms step (correlation 0.48 at lag 0, 0.12 one
-step either way). After a BTC move of at least 1 bp, ETH has made 63% of it
-within the same step and 95% within a second; after an ETH move, BTC makes
-36% and 71%. But as a predictor of the next move, the gap between a market
-and what its partner implies explains under 0.5% of the variance at every
-averaging window (0.25 to 5 s) and horizon (0.1 to 2 s). For ETH its sign is
-wrong: ETH's own moves, more frequent than the BTC-driven catch-ups, tend to
-continue. Swept as the lead-lag term on three sessions, it cost up to 59
-(4 h) and gained at most 5 (Monday). The first minutes of a spot-plus-perp
-recording show the same pattern for spot against the perpetual. On these
-markets the engine's cross-asset fair value has nothing to work with at the
-50 ms resolution a websocket feed gives; `config/binance_perp_spot.ini` keeps
-spot as reference markets for the longer test.
+**Cross-asset fair value on real data: a small signal, not enough on its
+own.** The simulator's largest gain over a single-instrument quoter comes
+from fair value that moves before an instrument's own market.
+`feeds/leadlag.py` measures whether that exists between real markets, in
+receipt time (what the engine sees), on a 50 ms grid.
+
+*BTC and ETH perpetuals* (4 h): most of the co-movement is in the same step
+(correlation 0.48 at lag 0, 0.12 one step either way). After a BTC move of at
+least 1 bp, ETH has made 63% of it within the same step and 95% within a
+second; after an ETH move, BTC makes 36% and 71%. As a predictor of the next
+move, the gap between a market and what its partner implies explains under
+0.5% of the variance at every averaging window (0.25 to 5 s) and horizon (0.1
+to 2 s), and for ETH its sign is wrong. Swept as the gap term on three
+sessions it cost up to 59 (4 h) and gained at most 5 (Monday).
+
+*Spot against perpetual* (3.7 h, 2026-11-16 19:31 to 23:15 UTC, both coins):
+the perpetual leads, not spot. Cross-correlation sums to 0.75 (BTC) and 0.83
+(ETH) at perp-first lags against 0.49 and 0.48 at spot-first lags; after a
+perp move of 1 bp spot makes 46% of it in the same step and 94-99% within a
+second. The gap term is useless here too (R² 0.000): most gaps open because
+the perpetual moved, and the perpetual does not come back. Spot's *own recent
+move* is different. Spot's log mid minus its 100 ms average predicts the
+perpetual's next 250 ms move with a coefficient of 0.51-0.69 and R² 2-3%,
+alike for BTC and ETH and in both halves of the session (3.0% then 2.4% for BTC, 3.4% then 1.9% for
+ETH); a regression of the perp's next move on both
+markets' last 50 ms returns puts 0.34 on spot's and 0.10 on its own, nearly
+doubling the R² of the perp's own return alone. That is the `momentum` lead
+shape, `lead = BTC-USDT-SPOT` in `config/binance_perp_spot.ini`.
+
+Swept on the same session (7-run jittered ensembles, mean P&L net of fees,
+gain 0.9, tau 250 ms; 0.02% maker fee / zero fee):
+
+| quote life | no lead | spot momentum |
+| --- | --- | --- |
+| 1 s | -18.6 / -26.9 | -3.1 / -16.4 |
+| 5 s | -12.9 / -31.9 | -6.9 / -29.5 |
+| 30 s | -1.3 / +40.7 | -2.0 / +39.0 (half the fills) |
+
+The signal works as a toxicity filter: whenever quotes move fast enough to use
+a half-second signal, it removes the fills that would have been picked off
+(fills drop by about a half at zero fee) and recovers most of the loss. It
+does not change the ranking: on this data, slow quoting beats fast, and the
+fee tier decides the sign. At 30 s quote life it earns the same on half the
+volume. The config ships with `lead_gain = 0`; 0.9 at 250 ms is the setting to
+try with fast quoting or on a rebate tier, after confirming it on another
+session. Spot as a factor observer (`ref_gain`) is off: with both markets at
+gain 1 the factor snaps to whichever ticked last, and the perpetual ticks
+several hundred times a second, so spot's information is erased within
+milliseconds.
 
 **Verified and not verified.** Tests cover the event format, the config
 files, the paper venue's fill rules, replay determinism (a session recorded

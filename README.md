@@ -33,7 +33,7 @@ See [docs/DESIGN.md](docs/DESIGN.md) for scope, design and roadmap, and
 
 ```sh
 cmake -S . -B build && cmake --build build     # or: ./build.sh  (g++ >= 11 only)
-./build/amm_tests                              # 48 tests
+./build/amm_tests                              # 50 tests
 python3 feeds/test_feeds.py                    # adapter tests, offline
 python3 feeds/test_trading.py                  # gateway, drop copy, reconciler, offline
 ./build/amm_sim --seeds 24 --duration 1800 --detail
@@ -157,7 +157,7 @@ feeds/                venue adapters (Binance, Coinbase, synthetic), Binance ord
 scripts/              live_gateway.sh: the whole live stack (dry | testnet)
 config/               sim.ini (reference universe), crypto.ini (starter live universe),
                       binance_perp.ini (BTC and ETH perpetuals, calibrated and swept),
-                      binance_perp_spot.ini (the same, with spot BTC and ETH as reference markets)
+                      binance_perp_spot.ini (the same, with spot BTC and ETH as reference markets and a spot-momentum lead term, off)
 tests/                unit and end-to-end tests
 docs/                 DESIGN.md, RESEARCH.md
 ```

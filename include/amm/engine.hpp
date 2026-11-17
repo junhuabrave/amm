@@ -78,13 +78,17 @@ class Engine {
     hedge_block_.assign(nf, 0);
     deps_.assign(nf, {});
     lead_deps_.assign(nf, {});
+    lead_inst_deps_.assign(inst_.size(), {});
     for (auto& in : inst_) {
       if (in.hedges_factor != kNoFactor) hedge_inst_[in.hedges_factor] = in.id;
       reprice(in.id);
       for (uint8_t j = 0; j < st_[in.id].ex.n; ++j) deps_[st_[in.id].ex.e[j].f].push_back(in.id);
       st_[in.id].fair = st_[in.id].model;
       st_[in.id].dirty = true;
-      if (in.lead_factor != kNoFactor && in.lead_gain != 0.0) lead_deps_[in.lead_factor].push_back(in.id);
+      if (in.lead_gain != 0.0) {
+        if (in.lead_inst != kNoInstrument) lead_inst_deps_[in.lead_inst].push_back(in.id);
+        else if (in.lead_factor != kNoFactor) lead_deps_[in.lead_factor].push_back(in.id);
+      }
     }
     refresh_liquidity();
     refresh_risk();
@@ -121,7 +125,8 @@ class Engine {
     //    if it follows one.
     if (in.ref_for_factor != kNoFactor)
       for (InstrumentId j : lead_deps_[in.ref_for_factor]) update_lead(j);
-    if (in.lead_factor != kNoFactor && in.lead_gain != 0.0) update_lead(id);
+    for (InstrumentId j : lead_inst_deps_[id]) update_lead(j);
+    if ((in.lead_factor != kNoFactor || in.lead_inst != kNoInstrument) && in.lead_gain != 0.0) update_lead(id);
     s.dirty = true;
     flush();
   }
@@ -363,7 +368,7 @@ class Engine {
     WinCurve win;
     Exposures ex;
     double model = kNaN, basis = 0.0, composite = kNaN, fair = kNaN;
-    double lead_ema = kNaN, lead_adj = 0.0;  // lead-lag: average gap to the leader, fair value shift
+    double lead_ema = kNaN, lead_x = kNaN, lead_adj = 0.0;  // lead-lag: average, last value, fair value shift
     TimeNs lead_ts = 0;
     double sigma = 0.0;  // price st.dev per sqrt(s)
     double m = 0.0;      // cov(price, portfolio value) per s
@@ -379,16 +384,23 @@ class Engine {
   void update_lead(InstrumentId id) {
     State& s = st_[id];
     const Instrument& in = inst_[id];
-    const double lead = fm_.level(in.lead_factor);
+    const double lead = in.lead_inst != kNoInstrument
+                            ? (st_[in.lead_inst].top.valid() ? st_[in.lead_inst].top.mid() : kNaN)
+                            : fm_.level(in.lead_factor);
     if (!s.top.valid() || !(lead > 0)) return;
     const double m = s.top.mid();
-    const double x = std::log(m) - in.lead_beta * std::log(lead);
-    if (!(s.lead_ema == s.lead_ema)) { s.lead_ema = x; s.lead_ts = now_; s.lead_adj = 0.0; return; }
+    const double x = in.lead_momentum ? in.lead_beta * std::log(lead)
+                                       : std::log(m) - in.lead_beta * std::log(lead);
+    if (!(s.lead_ema == s.lead_ema)) { s.lead_ema = s.lead_x = x; s.lead_ts = now_; s.lead_adj = 0.0; return; }
+    // the series is piecewise constant: it held its previous value since the last update
     const double dt = std::max(0.0, secs(now_ - s.lead_ts));
     s.lead_ts = now_;
-    s.lead_ema += (1.0 - std::exp(-dt / in.lead_tau_s)) * (x - s.lead_ema);
-    // x below its average: the leader has risen and we have not (yet)
-    s.lead_adj = m * (std::exp(-in.lead_gain * (x - s.lead_ema)) - 1.0);
+    s.lead_ema += (1.0 - std::exp(-dt / in.lead_tau_s)) * (s.lead_x - s.lead_ema);
+    s.lead_x = x;
+    // gap: x below its average means the leader has risen and we have not (yet).
+    // momentum: x above its average means the leader has just risen.
+    const double dev = x - s.lead_ema;
+    s.lead_adj = m * (std::exp((in.lead_momentum ? 1.0 : -1.0) * in.lead_gain * dev) - 1.0);
     s.dirty = true;
   }
 
@@ -594,6 +606,7 @@ class Engine {
   std::vector<State> st_;
   std::vector<std::vector<InstrumentId>> deps_;
   std::vector<std::vector<InstrumentId>> lead_deps_;  // per factor: instruments that follow it
+  std::vector<std::vector<InstrumentId>> lead_inst_deps_;  // per instrument: instruments that follow it
   std::vector<InstrumentId> hedge_inst_;
   std::vector<TimeNs> hedge_block_;
   std::vector<double> E_, SE_, WE_, W_;

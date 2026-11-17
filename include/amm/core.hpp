@@ -82,10 +82,17 @@ struct Instrument {
   FactorId hedges_factor = kNoFactor;   // this instrument is the hedge for a factor
   int pricer = -1;
   bool quote = true;  // false: a reference market, observed (factor, basis) but never quoted
-  // Lead-lag: when the leader factor has moved and this market has not yet
-  // followed, expect it to. Fair value moves by lead_gain times the deviation
-  // of ln(mid) - lead_beta * ln(leader level) from its average over lead_tau_s.
+  // Lead-lag: the leader is a factor level (lead_factor) or another market's
+  // mid (lead_inst, which takes precedence). Two shapes:
+  //   gap       the leader has moved and this market has not yet followed:
+  //             fair moves by lead_gain times the deviation of
+  //             ln(mid) - lead_beta * ln(leader) from its average over lead_tau_s.
+  //   momentum  the leader's own recent move, lead_beta * ln(leader) minus its
+  //             average over lead_tau_s, predicts this market's next move:
+  //             fair moves by lead_gain times it.
   FactorId lead_factor = kNoFactor;
+  InstrumentId lead_inst = kNoInstrument;
+  bool lead_momentum = false;
   double lead_beta = 1.0, lead_tau_s = 1.0, lead_gain = 0.0;
 };
 

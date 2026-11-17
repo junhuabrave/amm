@@ -6,7 +6,7 @@
 //   [factor NAME]                 level, vol (per sqrt second)
 //   [corr]                        A B = rho
 //   [instrument SYMBOL]           feed, class, protocol, tick, lot, mult, quote_size, max_pos,
-//                                 max_spread, fee, maker_fee, taker_fee, max_order_qty, quote, lead, lead_beta,
+//                                 max_spread, fee, maker_fee, taker_fee, max_order_qty, quote, lead, lead_mode, lead_beta,
 //                                 lead_tau_ms, lead_gain, idio_vol, A0, k0, rfq_a0, rfq_b0,
 //                                 ref_for, ref_gain, hedges, pricer
 //   pricer = linear FACTOR [a] [b] [l0]
@@ -30,7 +30,7 @@ struct CorrCfg { std::string a, b; double rho = 0.0; };
 struct InstrumentCfg {
   Instrument in;
   std::string feed;                      // symbol as the venue adapter emits it
-  std::string ref_for, hedges, lead;     // factor names
+  std::string ref_for, hedges, lead;     // factor names (lead: a factor or an instrument)
   std::vector<std::string> pricer;       // tokens of the pricer spec
   double max_order_qty = 0.0;            // pre-trade cap per order; 0 = max_pos
   double maker_fee = 0.0, taker_fee = 0.0;  // fraction of notional (0.0002 = 2 bp); negative = rebate
@@ -183,6 +183,11 @@ inline LiveConfig parse_config(std::istream& is, const std::string& name = "conf
       else if (key == "max_order_qty") ic.max_order_qty = num();
       else if (key == "quote") in.quote = to_bool(val, where());
       else if (key == "lead") ic.lead = val;
+      else if (key == "lead_mode") {
+        if (val == "gap") in.lead_momentum = false;
+        else if (val == "momentum") in.lead_momentum = true;
+        else throw std::runtime_error(where() + ": lead_mode must be gap or momentum");
+      }
       else if (key == "lead_beta") in.lead_beta = num();
       else if (key == "lead_tau_ms") in.lead_tau_s = num() * 1e-3;
       else if (key == "lead_gain") in.lead_gain = num();
@@ -310,7 +315,15 @@ inline void build_engine(const LiveConfig& cfg, Engine& eng) {
     if (!ic.ref_for.empty()) in.ref_for_factor = factor(ic.ref_for, ctx);
     if (!ic.hedges.empty()) in.hedges_factor = factor(ic.hedges, ctx);
     if (!ic.lead.empty()) {
-      in.lead_factor = factor(ic.lead, ctx);
+      // an instrument name (ids are assigned in file order) or a factor name
+      size_t li = 0;
+      while (li < cfg.instruments.size() && cfg.instruments[li].in.symbol != ic.lead) ++li;
+      if (li < cfg.instruments.size()) {
+        if (cfg.instruments[li].in.symbol == in.symbol) throw std::runtime_error(ctx + ": cannot lead itself");
+        in.lead_inst = static_cast<InstrumentId>(li);
+      } else {
+        in.lead_factor = factor(ic.lead, ctx);
+      }
       if (!(in.lead_tau_s > 0)) throw std::runtime_error(ctx + ": lead_tau_ms must be > 0");
     }
     in.pricer = eng.add_pricer(std::move(pr));
