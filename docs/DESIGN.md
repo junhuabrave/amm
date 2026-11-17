@@ -443,7 +443,7 @@ of each other and of the engine.
 | Runner | `live/runner.hpp`, `apps/amm_run.cpp` | Reads events from a pipe or a file, drives engine and venue, records, reports |
 | Calibration | `live/calibrate.hpp`, `apps/amm_calibrate.cpp` | Volatility, jumps, correlation, spreads and fill curve from a journal |
 | Parameter sweep | `apps/amm_sweep.cpp` | Replays one journal under a grid of config overrides, in parallel; P&L, drawdown, order rate, peak positions, P&L by time slice |
-| Adapters | `feeds/*.py` | Binance spot and perpetuals (REST polling, and websockets in `binance_ws.py` over `ws.py`), Coinbase; standard library only |
+| Adapters | `feeds/*.py` | Binance spot and perpetuals (REST polling, and websockets in `binance_ws.py` over `ws.py`), Bybit perpetuals (websockets, `bybit_ws.py`, through `binance_ws.py --bybit-perp`), Coinbase; standard library only |
 | Sample data | `apps/amm_record_sim.cpp`, `feeds/synthetic.py` | Journals and a live-style stream with no network |
 
 **Why adapters are separate processes.** A venue adapter only has to print

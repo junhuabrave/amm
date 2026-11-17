@@ -192,6 +192,10 @@ class WsConnection:
                 raise ConnectionClosed("server closed (%d %s)" % (code, payload[2:].decode("utf-8", "replace")))
         return out
 
+    def send_text(self, text):
+        """Send one text message (a subscription, an application-level ping)."""
+        self._send(encode_frame(OP_TEXT, text))
+
     def _send(self, data):
         self.sock.setblocking(True)
         try:

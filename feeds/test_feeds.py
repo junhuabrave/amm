@@ -11,6 +11,7 @@ import struct
 
 import binance
 import binance_ws
+import bybit_ws
 import coinbase
 import common
 import ws
@@ -249,6 +250,85 @@ class WebsocketConnection(unittest.TestCase):
         fake.sendall = lambda data: fake.b.sendall(b"HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: nope\r\n\r\n")
         with self.assertRaises(ws.ProtocolError):
             ws.WsConnection("ws://example.test/x", sock_factory=fake)
+
+
+# captured from wss://stream.bybit.com/v5/public/linear on 2026-11-17 (trade list cut to one entry)
+REAL_BYBIT_BOOK = ('{"topic":"orderbook.1.BTCUSDT","ts":1794901110206,"type":"snapshot","data":{"s":"BTCUSDT",'
+                   '"b":[["64608.5","1.394"]],"a":[["64608.6","3.447"]],"u":14709427,"seq":848209143210},"cts":1794901110203}')
+REAL_BYBIT_TRADE = ('{"topic":"publicTrade.BTCUSDT","type":"snapshot","ts":1794901110343,"data":[{"T":1794901110341,'
+                    '"s":"BTCUSDT","S":"Sell","v":"0.003","p":"64608.50","L":"MinusTick",'
+                    '"i":"f630e77f-fe3d-5e57-89de-f3a0492cdb5e","BT":false,"RPI":false,"seq":848209143723}]}')
+REAL_BYBIT_ACK = '{"success":true,"ret_msg":"","conn_id":"dbqqmhgc9dv6dqbn836g-1sfaq","req_id":"","op":"subscribe"}'
+REAL_BYBIT_PONG = '{"success":true,"ret_msg":"pong","conn_id":"dbqqmhgc9dv6dqbn836g-1sfaq","req_id":"","op":"ping"}'
+
+
+class BybitWebsocket(unittest.TestCase):
+    def test_real_messages(self):
+        b = bybit_ws.BybitPerp(["btcusdt"])
+        self.assertEqual(b.events(REAL_BYBIT_BOOK),
+                         [(("B", "BYBIT-PERP:BTCUSDT", 64608.5, 1.394, 64608.6, 3.447), "orderbook.1", 1794901110203)])
+        self.assertEqual(b.events(REAL_BYBIT_TRADE),
+                         [(("T", "BYBIT-PERP:BTCUSDT", 64608.5, 0.003, "S"), "publicTrade", 1794901110341)])
+        self.assertEqual(b.events(REAL_BYBIT_ACK), [])
+        self.assertEqual(b.events(REAL_BYBIT_PONG), [])
+
+    def test_deltas_update_one_side_and_a_removed_best_waits_for_its_replacement(self):
+        b = bybit_ws.BybitPerp(["BTCUSDT"])
+        b.events(REAL_BYBIT_BOOK)
+        delta = json.loads(REAL_BYBIT_BOOK)
+        delta["type"] = "delta"
+        delta["data"]["b"], delta["data"]["a"] = [["64608.4", "2"]], []
+        self.assertEqual(b.events(json.dumps(delta))[0][0], ("B", "BYBIT-PERP:BTCUSDT", 64608.4, 2.0, 64608.6, 3.447))
+        delta["data"]["b"] = [["64608.4", "0"]]  # best bid removed, no replacement in this push
+        self.assertEqual(b.events(json.dumps(delta)), [])
+        delta["data"]["b"] = [["64608.6", "1"]]  # crossed: never emitted
+        self.assertEqual(b.events(json.dumps(delta)), [])
+
+    def test_subscriptions_are_chunked(self):
+        b = bybit_ws.BybitPerp(["S%d" % i for i in range(7)])
+        subs = [json.loads(m) for m in b.subscriptions()]
+        self.assertEqual([len(m["args"]) for m in subs], [10, 4])
+        self.assertEqual(subs[0]["args"][:2], ["orderbook.1.S0", "publicTrade.S0"])
+
+    def test_run_subscribes_on_connect_and_pings(self):
+        t = [0]
+
+        def clock():
+            t[0] += 1_000_000_000  # 1 s per call
+            return t[0]
+
+        class Conn:
+            def __init__(self):
+                self.a, self.b = socket.socketpair()
+                self.b.send(b"x")
+                self.sent = []
+
+            def fileno(self):
+                return self.a.fileno()
+
+            def send_text(self, m):
+                self.sent.append(json.loads(m)["op"])
+
+            def read(self):
+                return [REAL_BYBIT_BOOK]
+
+            def close(self):
+                self.a.close()
+                self.b.close()
+
+        conns = []
+
+        def connect(url):
+            conns.append(Conn())
+            return conns[-1]
+
+        out, err = io.StringIO(), io.StringIO()
+        binance_ws.run([bybit_ws.BybitPerp(["BTCUSDT"])], duration=60, stats_every=0, out=out, err=err,
+                       connect=connect, clock=clock)
+        self.assertEqual(len(conns), 1)
+        self.assertEqual(conns[0].sent[0], "subscribe")
+        self.assertGreaterEqual(conns[0].sent.count("ping"), 1)
+        self.assertIn(",B,BYBIT-PERP:BTCUSDT,64608.5,1.394,64608.6,3.447", out.getvalue())
 
 
 class BinanceWebsocket(unittest.TestCase):

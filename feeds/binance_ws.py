@@ -22,7 +22,11 @@ connections, so a trade can be written a millisecond before or after the book
 change it caused; the engine treats both as observations of the same market.
 Exchange-to-receipt latency per stream is reported on stderr every --stats seconds.
 
-Nothing is sent to the venue but the websocket handshake: no account, no key, no orders.
+--bybit-perp adds Bybit USDT perpetuals (feeds/bybit_ws.py) to the same
+stream, as BYBIT-PERP:SYMBOL, for cross-venue measurements.
+
+Nothing is sent to the venue but the websocket handshake (and, for Bybit, a
+subscription and pings): no account, no key, no orders.
 """
 import argparse
 import json
@@ -117,15 +121,40 @@ class Stats:
         return "; ".join(parts) or "no messages"
 
 
+class BinanceStream:
+    """One Binance combined-stream connection (no subscription, no client pings)."""
+
+    ping_every = 0.0
+
+    def __init__(self, url, prefix):
+        self.url, self.prefix = url, prefix
+
+    def on_open(self, conn):
+        pass
+
+    def events(self, msg):
+        ev, kind, exch = to_event(msg, self.prefix)
+        return [] if ev is None else [(ev, kind, exch)]
+
+
+def as_stream(spec):
+    return BinanceStream(*spec) if isinstance(spec, tuple) else spec
+
+
 def run(specs, duration=None, stats_every=60.0, stall=30.0, cafile=None, out=sys.stdout, err=sys.stderr,
         connect=None, clock=time.time_ns):
     """Hold one websocket per spec, write event lines until `duration` seconds pass.
+
+    A spec is a Binance (url, prefix) pair or a stream object with url,
+    on_open(conn), events(msg) and ping_every / ping(conn) (bybit_ws.BybitPerp).
 
     A connection that fails, is closed by the server (Binance closes after
     24 h) or goes `stall` seconds without a message is reconnected with
     exponential back-off; the others keep running.
     """
     connect = connect or (lambda url: ws.WsConnection(url, cafile=cafile))
+    specs = [as_stream(x) for x in specs]
+    last_ping = {}
     sel = selectors.DefaultSelector()
     conns = {}  # spec index -> connection
     retry_at = {i: 0 for i in range(len(specs))}
@@ -144,21 +173,32 @@ def run(specs, duration=None, stats_every=60.0, stall=30.0, cafile=None, out=sys
             c.close()
         backoff[i] = min(60.0, max(1.0, 2.0 * backoff[i]))
         retry_at[i] = clock() + int(backoff[i] * 1e9)
-        print("feed %s: %s (reconnect in %.0fs)" % (specs[i][0].split("?")[0], why, backoff[i]), file=err, flush=True)
+        print("feed %s: %s (reconnect in %.0fs)" % (specs[i].url.split("?")[0], why, backoff[i]), file=err, flush=True)
 
     try:
         while duration is None or (clock() - start) / 1e9 < duration:
             now = clock()
-            for i, (url, _) in enumerate(specs):
+            for i, sp in enumerate(specs):
                 if i not in conns and now >= retry_at[i]:
+                    c = None
                     try:
-                        c = connect(url)
+                        c = connect(sp.url)
+                        sp.on_open(c)
                     except (OSError, ValueError) as e:
+                        if c is not None:
+                            c.close()
                         drop(i, e)
                         continue
                     conns[i] = c
-                    last_msg[i] = now
+                    last_msg[i] = last_ping[i] = now
                     sel.register(c, selectors.EVENT_READ, i)
+                elif i in conns and sp.ping_every and (now - last_ping[i]) / 1e9 >= sp.ping_every:
+                    try:
+                        sp.ping(conns[i])
+                    except OSError as e:
+                        drop(i, e)
+                        continue
+                    last_ping[i] = now
             for key, _ in sel.select(timeout=0.5 if conns else 0.2):
                 i = key.data
                 try:
@@ -174,11 +214,11 @@ def run(specs, duration=None, stats_every=60.0, stall=30.0, cafile=None, out=sys
                 lines = []
                 for m in msgs:
                     try:
-                        ev, kind, exch = to_event(m, specs[i][1])
+                        evs = specs[i].events(m)
                     except (ValueError, KeyError, TypeError) as e:
                         print("feed: unparsed message (%s): %.200s" % (e, m), file=err, flush=True)
                         continue
-                    if ev is not None:
+                    for ev, kind, exch in evs:
                         stats.add(kind, recv // 1_000_000, exch)
                         lines.append(common.line(recv, ev[0], ev[1], *ev[2:]))
                 if lines:
@@ -202,6 +242,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("spot", nargs="*", help="spot symbols, e.g. BTCUSDT")
     ap.add_argument("--perp", nargs="*", default=[], help="USD-M perpetual symbols")
+    ap.add_argument("--bybit-perp", nargs="*", default=[], help="Bybit USDT perpetual symbols (BYBIT-PERP:...)")
     ap.add_argument("--duration", type=float, help="stop after this many seconds")
     ap.add_argument("--stats", type=float, default=60.0, help="seconds between rate/latency reports on stderr (0: off)")
     ap.add_argument("--stall", type=float, default=30.0, help="reconnect a connection silent this many seconds")
@@ -210,9 +251,12 @@ def main():
     ap.add_argument("--perp-book-url", default=PERP_BOOK_WS)
     ap.add_argument("--perp-trade-url", default=PERP_TRADE_WS)
     a = ap.parse_args()
-    if not a.spot and not a.perp:
+    if not a.spot and not a.perp and not a.bybit_perp:
         ap.error("give at least one symbol")
-    specs = stream_urls(a.spot, a.perp, a.spot_url, a.perp_book_url, a.perp_trade_url)
+    specs = stream_urls(a.spot, a.perp, a.spot_url, a.perp_book_url, a.perp_trade_url) if a.spot or a.perp else []
+    if a.bybit_perp:
+        import bybit_ws
+        specs.append(bybit_ws.BybitPerp(a.bybit_perp))
     try:
         run(specs, a.duration, a.stats, a.stall, a.cafile)
     except (KeyboardInterrupt, BrokenPipeError):

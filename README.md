@@ -76,7 +76,9 @@ python3 feeds/synthetic.py --seconds 600 | ./build/amm_run --config config/crypt
   It uses a small standard-library websocket client (`feeds/ws.py`), reconnects
   on drops and silences, and reports rate and exchange-to-receipt latency on
   stderr. TLS is always verified; Python builds without a CA bundle fall back
-  to the system one (or `--cafile` / `$AMM_CAFILE`).
+  to the system one (or `--cafile` / `$AMM_CAFILE`). `--bybit-perp BTCUSDT ...`
+  adds Bybit USDT perpetuals (`feeds/bybit_ws.py`, as `BYBIT-PERP:...`) to the
+  same stream and clock, for cross-venue lead-lag measurements.
 - Instruments, factors, pricers and engine parameters live in `config/*.ini`.
   The numbers in `config/crypto.ini` are placeholders: record an hour, run
   `amm_calibrate`, and replace them.
