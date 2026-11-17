@@ -160,6 +160,7 @@ scripts/              live_gateway.sh: the whole live stack (dry | testnet)
 config/               sim.ini (reference universe), crypto.ini (starter live universe),
                       binance_perp.ini (BTC and ETH perpetuals, calibrated and swept),
                       binance_perp_spot.ini (the same, with spot BTC and ETH as reference markets and a spot-momentum lead term, off)
+                      binance_bybit.ini (the same, plus Bybit BTC and ETH perpetuals as reference markets)
 tests/                unit and end-to-end tests
 docs/                 DESIGN.md, RESEARCH.md
 ```

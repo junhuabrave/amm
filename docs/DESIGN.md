@@ -631,12 +631,41 @@ a half-second signal, it removes the fills that would have been picked off
 (fills drop by about a half at zero fee) and recovers most of the loss. It
 does not change the ranking: on this data, slow quoting beats fast, and the
 fee tier decides the sign. At 30 s quote life it earns the same on half the
-volume. The config ships with `lead_gain = 0`; 0.9 at 250 ms is the setting to
-try with fast quoting or on a rebate tier, after confirming it on another
-session. Spot as a factor observer (`ref_gain`) is off: with both markets at
+volume. The config ships with `lead_gain = 0`; on this session 0.9 at 250 ms was
+best with fast quoting, but a second session (below) favours 0.3-0.6. Spot as a factor observer (`ref_gain`) is off: with both markets at
 gain 1 the factor snaps to whichever ticked last, and the perpetual ticks
 several hundred times a second, so spot's information is erased within
 milliseconds.
+
+*A second session, and a second venue* (58 min, 2026-11-17 07:39 to 08:37
+UTC; the recording was cut short when TLS to both venues began failing
+verification, as the day before). Bybit's BTC and ETH perpetuals
+(`feeds/bybit_ws.py`) were recorded in the same stream as Binance spot and
+perpetuals. Binance does not lead Bybit: for BTC the cross-correlation mass is
+on the Bybit-first side (0.64 against 0.30), for ETH it is about even. Bybit's
+own recent move predicts Binance's next one about as well as spot does (R²
+2-6% at 500 ms), but the two halves of the hour disagree widely (BTC R² 3% then
+15%), the mark of a few large moves. Spot's momentum signal held with the same
+sign at about half the size of the first session: coefficient 0.26-0.48 at 100
+ms and 250 ms, R² 0.9-1.8%.
+
+The hour was a losing one for every setting (-37 at zero fee and 30 s quote
+life, against +41 the day before). Swept the same way (7-run ensembles, tau
+250 ms, mean P&L; 0.02% maker fee / zero fee; with the fee there are only
+9-64 fills, so read those as indicative):
+
+| quote life | no lead | spot, gain 0.6 | Bybit, gain 0.6 |
+| --- | --- | --- | --- |
+| 1 s | -14.3 / -28.0 | -14.2 / -21.5 | -14.0 / -22.5 |
+| 5 s | -14.8 / -36.1 | -13.2 / -36.2 | -14.2 / -29.4 |
+| 30 s | -12.3 / -37.1 | -3.5 / -33.4 | -11.4 / -34.6 |
+
+Spot momentum improved or matched the no-lead result in most cells on both
+sessions; Bybit as leader was not monotone in the gain and was worse than no
+lead in several cells. A lower gain than the first session suggested (0.3-0.6
+rather than 0.9) fits both. `config/binance_bybit.ini` carries all six
+markets for longer cross-venue recordings. None of this turns a losing fee
+tier into a winning one.
 
 **Verified and not verified.** Tests cover the event format, the config
 files, the paper venue's fill rules, replay determinism (a session recorded
