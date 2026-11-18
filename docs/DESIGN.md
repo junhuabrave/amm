@@ -442,7 +442,7 @@ of each other and of the engine.
 | Paper venue | `live/paper.hpp` | Matches our orders locally against the real book and prints |
 | Runner | `live/runner.hpp`, `apps/amm_run.cpp` | Reads events from a pipe or a file, drives engine and venue, records, reports |
 | Calibration | `live/calibrate.hpp`, `apps/amm_calibrate.cpp` | Volatility, jumps, correlation, spreads and fill curve from a journal |
-| Parameter sweep | `apps/amm_sweep.cpp` | Replays one journal under a grid of config overrides, in parallel; P&L, drawdown, order rate, peak positions, P&L by time slice |
+| Parameter sweep | `apps/amm_sweep.cpp` | Replays one or more journals (plain or .gz) under a grid of config overrides, in parallel; P&L, drawdown, order rate, peak positions, P&L by time slice, and a cross-session ranking |
 | Adapters | `feeds/*.py` | Binance spot and perpetuals (REST polling, and websockets in `binance_ws.py` over `ws.py`), Bybit perpetuals (websockets, `bybit_ws.py`, through `binance_ws.py --bybit-perp`), Coinbase; standard library only |
 | Sample data | `apps/amm_record_sim.cpp`, `feeds/synthetic.py` | Journals and a live-style stream with no network |
 
@@ -503,7 +503,7 @@ from its own fills.
 
 **Backtesting.** Replay is the backtest: a journal recorded live (or from the
 simulator) runs through the same runner and paper venue, and gives the same
-result every time. `amm_sweep` replays one journal under a grid of config
+result every time. `amm_sweep` replays a journal under a grid of config
 overrides (`--set engine.gamma=0.01,0.05,0.2`, `--set instrument:*.max_pos=...`)
 on all cores and tabulates P&L, drawdown, order rate, how close each
 instrument came to its limit, and P&L per time slice (`--split N`). The
@@ -511,6 +511,14 @@ journal is read and parsed once and every run steps through it in lockstep,
 so a 12-setting grid over a 4-hour journal (800 MB, 11M events) takes about
 10 s; separate readers per run thrashed the file cache on an 8 GB machine and
 took 48 minutes.
+
+A setting picked on one session is fitted to it. `--replay` can be given
+several times (`.gz` journals are read through `gzip -dc`): every setting is
+replayed on each session from a fresh engine and paper venue, and a final
+table ranks settings by P&L summed over sessions, with each session's mean
+over the jittered copies, the worst session, and in how many sessions the
+setting beat the median setting. A setting that wins on the total because of
+one session shows up as a poor worst-session figure and few wins.
 
 Paper P&L is strongly path dependent: one different fill changes every later
 quote, position and fill. On the 4-hour journal, changing ETH's k0 from 19.68
@@ -666,6 +674,23 @@ lead in several cells. A lower gain than the first session suggested (0.3-0.6
 rather than 0.9) fits both. `config/binance_bybit.ini` carries all six
 markets for longer cross-venue recordings. None of this turns a losing fee
 tier into a winning one.
+
+*Across both sessions* (`amm_sweep --replay` twice, 5 copies each, tau 250 ms;
+total of the two sessions' mean P&L, worst session in brackets):
+
+| maker fee, quote life | gain 0 | 0.3 | 0.6 | 0.9 |
+| --- | --- | --- | --- | --- |
+| 0.02%, 30 s | -11.8 (-10.5) | -10.7 (-7.0) | -7.3 (-3.9) | -6.8 (-4.8) |
+| 0.02%, 5 s | -26.5 (-13.8) | -29.7 (-15.8) | -18.4 (-12.0) | -20.7 (-13.4) |
+| 0.02%, 1 s | -29.9 (-18.2) | -24.7 (-13.1) | -24.6 (-14.6) | -16.8 (-14.2) |
+| zero, 30 s | +1.3 (-37.4) | +5.3 (-31.0) | -6.5 (-33.4) | +10.2 (-29.1) |
+| zero, 1 s | -50.4 (-27.5) | -41.4 (-27.5) | -37.0 (-22.2) | -37.2 (-22.8) |
+
+At the 0.02% tier a gain of 0.6-0.9 beats no lead on the total and on the
+worst session at every quote life; the improvement comes mostly from the
+second session (on the first, at 30 s, no lead is narrowly best). At zero
+fee the 30 s row is not monotone in the gain: path noise is as large as the
+effect there. A third session decides whether the config turns it on.
 
 **Verified and not verified.** Tests cover the event format, the config
 files, the paper venue's fill rules, replay determinism (a session recorded

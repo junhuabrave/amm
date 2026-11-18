@@ -62,6 +62,9 @@ python3 feeds/leadlag.py data/session.csv BINANCE:BTCUSDT BINANCE-PERP:BTCUSDT  
 # --split N shows P&L by time slice, --jitter N averages over N perturbed paths per setting
 ./build/amm_sweep --config config/binance_perp.ini --replay data/session.csv \
   --set engine.gamma=0.005,0.05 --set engine.min_quote_life_ms=1000,5000,10000 --jitter 15
+# several sessions (plain or .gz): each setting on each, ranked by the total, with the worst session
+./build/amm_sweep --config config/binance_perp.ini --replay data/mon.csv --replay data/tue.csv.gz \
+  --set engine.min_quote_life_ms=1000,30000 --jitter 4
 
 # no network: try the same pipe on a synthetic stream, or on a simulator journal
 python3 feeds/synthetic.py --seconds 600 | ./build/amm_run --config config/crypto.ini

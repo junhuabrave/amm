@@ -10,6 +10,11 @@
 // spread over --jobs threads (default: all cores); results are sorted by P&L.
 // --split N also reports P&L in N equal time slices, to show whether a setting
 // wins throughout or in one stretch. --csv FILE writes one row per run.
+// --replay may be given several times (plain or .gz journals): every setting
+// is replayed on each session separately (fresh engine, fresh paper venue),
+// and a final table ranks settings by P&L summed over sessions, with each
+// session's result and the worst one, so a choice is judged out of the session
+// that suggested it.
 // --jitter N replays every setting N more times with each instrument's A0 and
 // k0 scaled by a fixed random factor within +-1%, and summarises each setting
 // by mean and spread. Paper P&L is strongly path dependent (one different fill
@@ -36,6 +41,7 @@ using namespace amm::live;
 
 struct Axis { std::string section, key; std::vector<std::string> values; };
 struct Result {
+  size_t session = 0;
   std::vector<std::string> values;
   size_t point = 0;  // grid point; jittered copies share it
   double pnl = 0, dd = 0, volume = 0, orders_s = 0, fees = 0;
@@ -74,6 +80,41 @@ amm::TimeNs last_ts(const std::string& path) {
     if (t >= 0 || back >= size) return t;
   }
 }
+
+bool gzipped(const std::string& path) { return path.size() > 3 && path.compare(path.size() - 3, 3, ".gz") == 0; }
+
+// Lines of a journal, plain or gzip-compressed (through gzip -dc).
+class LineSource {
+ public:
+  explicit LineSource(const std::string& path) : pipe_(gzipped(path)) {
+    if (pipe_) {
+      std::string q;
+      for (char c : path) { if (c == '\'') q += "'\\''"; else q += c; }
+      f_ = popen(("gzip -dc '" + q + "'").c_str(), "r");
+    } else {
+      f_ = std::fopen(path.c_str(), "r");
+    }
+    if (!f_) throw std::runtime_error("cannot open replay file: " + path);
+  }
+  ~LineSource() {
+    if (f_) pipe_ ? pclose(f_) : std::fclose(f_);
+    std::free(buf_);
+  }
+  LineSource(const LineSource&) = delete;
+  LineSource& operator=(const LineSource&) = delete;
+  bool next(std::string& line) {
+    const ssize_t n = getline(&buf_, &cap_, f_);
+    if (n < 0) return false;
+    line.assign(buf_, size_t(n) - (n > 0 && buf_[n - 1] == '\n' ? 1 : 0));
+    return true;
+  }
+
+ private:
+  bool pipe_;
+  FILE* f_ = nullptr;
+  char* buf_ = nullptr;
+  size_t cap_ = 0;
+};
 
 // One configuration being replayed, with its time-slice bookkeeping.
 struct Run {
@@ -119,7 +160,8 @@ void finish(Run& run, const LiveConfig& cfg, double width) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string config, replay, csv;
+  std::string config, csv;
+  std::vector<std::string> replays;
   std::vector<Axis> axes;
   int split = 0, jitter = 0;
   unsigned jobs = std::max(1u, std::thread::hardware_concurrency());
@@ -127,7 +169,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
       const auto arg = [&](const char* name) { return !std::strcmp(argv[i], name) && i + 1 < argc; };
       if (arg("--config")) config = argv[++i];
-      else if (arg("--replay")) replay = argv[++i];
+      else if (arg("--replay")) replays.push_back(argv[++i]);
       else if (arg("--set")) axes.push_back(parse_axis(argv[++i]));
       else if (arg("--csv")) csv = argv[++i];
       else if (arg("--split")) split = std::max(0, std::atoi(argv[++i]));
@@ -135,13 +177,16 @@ int main(int argc, char** argv) {
       else if (arg("--jobs")) jobs = static_cast<unsigned>(std::max(1, std::atoi(argv[++i])));
       else throw std::runtime_error(std::string("unknown argument ") + argv[i]);
     }
-    if (config.empty() || replay.empty())
-      throw std::runtime_error("usage: amm_sweep --config FILE --replay FILE [--set SECTION.KEY=V1,V2,...]... "
-                               "[--split N] [--jitter N] [--jobs N] [--csv FILE]");
+    if (config.empty() || replays.empty())
+      throw std::runtime_error("usage: amm_sweep --config FILE --replay FILE [--replay FILE]... "
+                               "[--set SECTION.KEY=V1,V2,...]... [--split N] [--jitter N] [--jobs N] [--csv FILE]");
     std::ifstream cf(config);
     if (!cf) throw std::runtime_error("cannot open config file: " + config);
     const std::string base((std::istreambuf_iterator<char>(cf)), std::istreambuf_iterator<char>());
-    if (!std::ifstream(replay)) throw std::runtime_error("cannot open replay file: " + replay);
+    for (const auto& r : replays) {
+      if (!std::ifstream(r)) throw std::runtime_error("cannot open replay file: " + r);
+      if (split > 0 && gzipped(r)) throw std::runtime_error("--split needs an uncompressed journal: " + r);
+    }
 
     // Every combination, first axis varying slowest. All configs are built and
     // parsed before any run, so a bad key fails in a second, not after an hour.
@@ -171,110 +216,165 @@ int main(int argc, char** argv) {
       }
     }
 
-    // Lockstep: the journal is read and parsed once, and each batch of events
-    // is fed to every run, the runs spread over the worker threads. Separate
-    // readers per run thrash the file cache once a journal outgrows free memory.
-    std::vector<Run> runs(cfgs.size());
-    for (size_t i = 0; i < runs.size(); ++i) {
-      runs[i].r.values = grid[point_of[i]];
-      runs[i].r.point = point_of[i];
-      try { runs[i].runner = std::make_unique<Runner>(cfgs[i], RunnerOptions{}); }
-      catch (const std::exception& e) { runs[i].r.error = e.what(); }
-    }
-    std::ifstream in(replay);
-    std::vector<MdEvent> batch(1 << 15);
-    size_t n = 0;
-    std::string line;
-    amm::TimeNs t0 = -1;
-    double width = 0.0;
-    const unsigned workers = static_cast<unsigned>(std::min<size_t>(jobs, runs.size()));
-    auto feed = [&] {
-      std::vector<std::thread> pool;
-      for (unsigned w = 0; w < workers; ++w)
-        pool.emplace_back([&, w] {
-          for (size_t i = w; i < runs.size(); i += workers)
-            for (size_t e = 0; e < n; ++e) step(runs[i], batch[e], split, t0, width);
-        });
-      for (auto& t : pool) t.join();
-      n = 0;
-    };
-    while (std::getline(in, line)) {
-      if (!parse_event(line, batch[n])) continue;
-      if (t0 < 0) {
-        t0 = batch[n].ts;
-        const amm::TimeNs t1 = split > 0 ? last_ts(replay) : t0;
-        width = split > 0 && t1 > t0 ? double(t1 - t0) / split : 0.0;
+    std::vector<Result> all;
+    for (size_t session = 0; session < replays.size(); ++session) {
+      const std::string& replay = replays[session];
+      std::vector<Result> res;
+      // Lockstep: the journal is read and parsed once, and each batch of events
+      // is fed to every run, the runs spread over the worker threads. Separate
+      // readers per run thrash the file cache once a journal outgrows free memory.
+      std::vector<Run> runs(cfgs.size());
+      for (size_t i = 0; i < runs.size(); ++i) {
+        runs[i].r.values = grid[point_of[i]];
+        runs[i].r.point = point_of[i];
+        runs[i].r.session = session;
+        try { runs[i].runner = std::make_unique<Runner>(cfgs[i], RunnerOptions{}); }
+        catch (const std::exception& e) { runs[i].r.error = e.what(); }
       }
-      if (++n == batch.size()) feed();
-    }
-    feed();
-    std::vector<Result> res;
-    for (size_t i = 0; i < runs.size(); ++i) {
-      finish(runs[i], cfgs[i], width);
-      res.push_back(std::move(runs[i].r));
+      LineSource in(replay);
+      std::vector<MdEvent> batch(1 << 15);
+      size_t n = 0;
+      std::string line;
+      amm::TimeNs t0 = -1;
+      double width = 0.0;
+      const unsigned workers = static_cast<unsigned>(std::min<size_t>(jobs, runs.size()));
+      auto feed = [&] {
+        std::vector<std::thread> pool;
+        for (unsigned w = 0; w < workers; ++w)
+          pool.emplace_back([&, w] {
+            for (size_t i = w; i < runs.size(); i += workers)
+              for (size_t e = 0; e < n; ++e) step(runs[i], batch[e], split, t0, width);
+          });
+        for (auto& t : pool) t.join();
+        n = 0;
+      };
+      while (in.next(line)) {
+        if (!parse_event(line, batch[n])) continue;
+        if (t0 < 0) {
+          t0 = batch[n].ts;
+          const amm::TimeNs t1 = split > 0 ? last_ts(replay) : t0;
+          width = split > 0 && t1 > t0 ? double(t1 - t0) / split : 0.0;
+        }
+        if (++n == batch.size()) feed();
+      }
+      feed();
+      for (size_t i = 0; i < runs.size(); ++i) {
+        finish(runs[i], cfgs[i], width);
+        res.push_back(std::move(runs[i].r));
+      }
+
+      std::vector<size_t> order(res.size());
+      for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+      std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return res[a].pnl > res[b].pnl; });
+
+      const LiveConfig& c0 = cfgs.front();
+      std::printf("%zu runs on %s\n\n", res.size(), replay.c_str());
+      for (const Axis& a : axes) std::printf("%-*s ", int(std::max<size_t>(10, (a.section + "." + a.key).size())), (a.section + "." + a.key).c_str());
+      std::printf("%10s %9s %9s %8s %12s %9s", "P&L", "fees", "max dd", "fills", "volume", "orders/s");
+      for (const auto& ic : c0.instruments) std::printf(" %10.10s", ("peak " + ic.in.symbol).c_str());
+      for (int s = 0; s < split; ++s) std::printf(" %8s", ("slice" + std::to_string(s + 1)).c_str());
+      std::printf("\n");
+      for (size_t i : order) {
+        const Result& r = res[i];
+        for (size_t k = 0; k < axes.size(); ++k)
+          std::printf("%-*s ", int(std::max<size_t>(10, (axes[k].section + "." + axes[k].key).size())), r.values[k].c_str());
+        if (!r.error.empty()) { std::printf("error: %s\n", r.error.c_str()); continue; }
+        if (!r.warm) { std::printf("engine never started (no book for every instrument)\n"); continue; }
+        std::printf("%10.2f %9.2f %9.2f %8llu %12.0f %9.1f", r.pnl, r.fees, r.dd, static_cast<unsigned long long>(r.fills), r.volume, r.orders_s);
+        for (double p : r.peak_frac) std::printf(" %9.0f%%", 100 * p);
+        for (double s : r.slices) std::printf(" %8.2f", s);
+        std::printf("%s\n", r.halted ? "  HALTED" : "");
+      }
+      if (jitter > 0) {
+        struct Agg { double sum = 0, sq = 0, lo = 1e300, dd = 0, ord = 0, fees = 0, vol = 0; int n = 0; };
+        std::vector<Agg> agg(grid.size());
+        for (const Result& r : res) {
+          if (!r.error.empty() || !r.warm) continue;
+          Agg& a = agg[r.point];
+          a.sum += r.pnl; a.sq += r.pnl * r.pnl; a.lo = std::min(a.lo, r.pnl); a.dd += r.dd; a.ord += r.orders_s;
+          a.fees += r.fees; a.vol += r.volume; ++a.n;
+        }
+        std::vector<size_t> pts(grid.size());
+        for (size_t i = 0; i < pts.size(); ++i) pts[i] = i;
+        auto mean = [&](size_t i) { return agg[i].n ? agg[i].sum / agg[i].n : -1e300; };
+        std::stable_sort(pts.begin(), pts.end(), [&](size_t a, size_t b) { return mean(a) > mean(b); });
+        std::printf("\nby setting, over %d jittered copies each (A0, k0 within +-1%%):\n", jitter + 1);
+        for (const Axis& a : axes) std::printf("%-*s ", int(std::max<size_t>(10, (a.section + "." + a.key).size())), (a.section + "." + a.key).c_str());
+        std::printf("%10s %9s %9s %9s %9s %11s %9s %6s\n", "mean P&L", "st.dev", "worst", "mean dd", "fees", "volume", "orders/s", "runs");
+        for (size_t i : pts) {
+          const Agg& a = agg[i];
+          for (size_t k = 0; k < axes.size(); ++k)
+            std::printf("%-*s ", int(std::max<size_t>(10, (axes[k].section + "." + axes[k].key).size())), grid[i][k].c_str());
+          if (!a.n) { std::printf("no completed runs\n"); continue; }
+          const double m = a.sum / a.n, sd = a.n > 1 ? std::sqrt(std::max(0.0, (a.sq - a.n * m * m) / (a.n - 1))) : 0.0;
+          std::printf("%10.2f %9.2f %9.2f %9.2f %9.2f %11.0f %9.1f %6d\n", m, sd, a.lo, a.dd / a.n, a.fees / a.n, a.vol / a.n,
+                      a.ord / a.n, a.n);
+        }
+      }
+      std::printf("\npeak = largest |position| as a share of max_pos. Paper P&L understates spread capture;\n"
+                  "a setting chosen on one session is fitted to it, so confirm it on another.\n");
+
+      all.insert(all.end(), res.begin(), res.end());
     }
 
-    std::vector<size_t> order(res.size());
-    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
-    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return res[a].pnl > res[b].pnl; });
-
-    const LiveConfig& c0 = cfgs.front();
-    std::printf("%zu runs on %s\n\n", res.size(), replay.c_str());
-    for (const Axis& a : axes) std::printf("%-*s ", int(std::max<size_t>(10, (a.section + "." + a.key).size())), (a.section + "." + a.key).c_str());
-    std::printf("%10s %9s %9s %8s %12s %9s", "P&L", "fees", "max dd", "fills", "volume", "orders/s");
-    for (const auto& ic : c0.instruments) std::printf(" %10.10s", ("peak " + ic.in.symbol).c_str());
-    for (int s = 0; s < split; ++s) std::printf(" %8s", ("slice" + std::to_string(s + 1)).c_str());
-    std::printf("\n");
-    for (size_t i : order) {
-      const Result& r = res[i];
-      for (size_t k = 0; k < axes.size(); ++k)
-        std::printf("%-*s ", int(std::max<size_t>(10, (axes[k].section + "." + axes[k].key).size())), r.values[k].c_str());
-      if (!r.error.empty()) { std::printf("error: %s\n", r.error.c_str()); continue; }
-      if (!r.warm) { std::printf("engine never started (no book for every instrument)\n"); continue; }
-      std::printf("%10.2f %9.2f %9.2f %8llu %12.0f %9.1f", r.pnl, r.fees, r.dd, static_cast<unsigned long long>(r.fills), r.volume, r.orders_s);
-      for (double p : r.peak_frac) std::printf(" %9.0f%%", 100 * p);
-      for (double s : r.slices) std::printf(" %8.2f", s);
-      std::printf("%s\n", r.halted ? "  HALTED" : "");
-    }
-    if (jitter > 0) {
-      struct Agg { double sum = 0, sq = 0, lo = 1e300, dd = 0, ord = 0, fees = 0, vol = 0; int n = 0; };
-      std::vector<Agg> agg(grid.size());
-      for (const Result& r : res) {
-        if (!r.error.empty() || !r.warm) continue;
-        Agg& a = agg[r.point];
-        a.sum += r.pnl; a.sq += r.pnl * r.pnl; a.lo = std::min(a.lo, r.pnl); a.dd += r.dd; a.ord += r.orders_s;
-        a.fees += r.fees; a.vol += r.volume; ++a.n;
+    if (replays.size() > 1) {
+      // per grid point and session: mean over jittered copies; a point with a
+      // failed run in any session is reported as such, never ranked on part of the data
+      const size_t ns = replays.size();
+      std::vector<double> sum(grid.size() * ns, 0.0);
+      std::vector<int> cnt(grid.size() * ns, 0);
+      std::vector<bool> bad(grid.size(), false);
+      for (const Result& r : all) {
+        if (!r.error.empty() || !r.warm) { bad[r.point] = true; continue; }
+        sum[r.point * ns + r.session] += r.pnl;
+        ++cnt[r.point * ns + r.session];
       }
+      auto m = [&](size_t g, size_t k) { return cnt[g * ns + k] ? sum[g * ns + k] / cnt[g * ns + k] : 0.0; };
+      auto total = [&](size_t g) { double t = 0; for (size_t k = 0; k < ns; ++k) t += m(g, k); return t; };
       std::vector<size_t> pts(grid.size());
       for (size_t i = 0; i < pts.size(); ++i) pts[i] = i;
-      auto mean = [&](size_t i) { return agg[i].n ? agg[i].sum / agg[i].n : -1e300; };
-      std::stable_sort(pts.begin(), pts.end(), [&](size_t a, size_t b) { return mean(a) > mean(b); });
-      std::printf("\nby setting, over %d jittered copies each (A0, k0 within +-1%%):\n", jitter + 1);
+      std::stable_sort(pts.begin(), pts.end(), [&](size_t a, size_t b) {
+        if (bad[a] != bad[b]) return !bad[a];
+        return total(a) > total(b);
+      });
+      std::printf("\nacross %zu sessions (mean P&L over %d cop%s per session):\n", ns, jitter + 1, jitter ? "ies" : "y");
+      for (size_t k = 0; k < ns; ++k) std::printf("  S%zu = %s\n", k + 1, replays[k].c_str());
       for (const Axis& a : axes) std::printf("%-*s ", int(std::max<size_t>(10, (a.section + "." + a.key).size())), (a.section + "." + a.key).c_str());
-      std::printf("%10s %9s %9s %9s %9s %11s %9s %6s\n", "mean P&L", "st.dev", "worst", "mean dd", "fees", "volume", "orders/s", "runs");
-      for (size_t i : pts) {
-        const Agg& a = agg[i];
+      std::printf("%10s %9s %8s", "total", "worst", "wins");
+      for (size_t k = 0; k < ns; ++k) std::printf(" %9s", ("S" + std::to_string(k + 1)).c_str());
+      std::printf("\n");
+      for (size_t g : pts) {
         for (size_t k = 0; k < axes.size(); ++k)
-          std::printf("%-*s ", int(std::max<size_t>(10, (axes[k].section + "." + axes[k].key).size())), grid[i][k].c_str());
-        if (!a.n) { std::printf("no completed runs\n"); continue; }
-        const double m = a.sum / a.n, sd = a.n > 1 ? std::sqrt(std::max(0.0, (a.sq - a.n * m * m) / (a.n - 1))) : 0.0;
-        std::printf("%10.2f %9.2f %9.2f %9.2f %9.2f %11.0f %9.1f %6d\n", m, sd, a.lo, a.dd / a.n, a.fees / a.n, a.vol / a.n,
-                    a.ord / a.n, a.n);
+          std::printf("%-*s ", int(std::max<size_t>(10, (axes[k].section + "." + axes[k].key).size())), grid[g][k].c_str());
+        if (bad[g]) { std::printf("failed or never started in some session\n"); continue; }
+        double worst = 1e300;
+        int wins = 0;  // sessions where this point beats the median point
+        for (size_t k = 0; k < ns; ++k) {
+          worst = std::min(worst, m(g, k));
+          std::vector<double> col;
+          for (size_t h = 0; h < grid.size(); ++h) if (!bad[h]) col.push_back(m(h, k));
+          std::sort(col.begin(), col.end());
+          if (!col.empty() && m(g, k) > col[col.size() / 2]) ++wins;
+        }
+        std::printf("%10.2f %9.2f %5d/%-2zu", total(g), worst, wins, ns);
+        for (size_t k = 0; k < ns; ++k) std::printf(" %9.2f", m(g, k));
+        std::printf("\n");
       }
+      std::printf("\nwins = sessions in which the setting is above the median setting.\n");
     }
-    std::printf("\npeak = largest |position| as a share of max_pos. Paper P&L understates spread capture;\n"
-                "a setting chosen on one session is fitted to it, so confirm it on another.\n");
 
     if (!csv.empty()) {
       std::ofstream out(csv);
       if (!out) throw std::runtime_error("cannot write " + csv);
+      const LiveConfig& c0 = cfgs.front();
+      out << "session,";
       for (const Axis& a : axes) out << a.section << '.' << a.key << ',';
       out << "pnl,fees,max_dd,fills,volume,orders_per_s,halted";
       for (const auto& ic : c0.instruments) out << ",peak_frac_" << ic.in.symbol;
       for (int s = 0; s < split; ++s) out << ",slice" << s + 1;
       out << ",error\n";
-      for (size_t i : order) {
-        const Result& r = res[i];
+      for (const Result& r : all) {
+        out << replays[r.session] << ',';
         for (const auto& v : r.values) out << v << ',';
         out << r.pnl << ',' << r.fees << ',' << r.dd << ',' << r.fills << ',' << r.volume << ',' << r.orders_s << ',' << r.halted;
         for (size_t k = 0; k < c0.instruments.size(); ++k) out << ',' << (k < r.peak_frac.size() ? r.peak_frac[k] : 0.0);
