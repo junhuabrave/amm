@@ -3,6 +3,8 @@
 
     python3 feeds/leadlag.py data/session.csv BINANCE:BTCUSDT BINANCE-PERP:BTCUSDT
 
+The journal may be gzipped (.gz).
+
 Times are receipt times as recorded, which is what the engine sees: a lead
 here is one the engine can use, whatever its cause on the exchange side
 (matching-engine order, network path, websocket batching).
@@ -20,6 +22,7 @@ Two measures, on mids sampled every --step milliseconds:
 Both are reported in both directions (A->B and B->A). Standard library only.
 """
 import argparse
+import gzip
 import math
 import sys
 
@@ -30,7 +33,8 @@ def load_mids(path, syms, step_ns):
     last = {}
     grid = {s: [] for s in syms}
     t_next = None
-    with open(path, "rb") as f:
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rb") as f:
         for raw in f:
             p = raw.split(b",")
             if len(p) != 7 or p[1] != b"B":

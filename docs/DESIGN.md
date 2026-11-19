@@ -640,7 +640,8 @@ a half-second signal, it removes the fills that would have been picked off
 does not change the ranking: on this data, slow quoting beats fast, and the
 fee tier decides the sign. At 30 s quote life it earns the same on half the
 volume. The config ships with `lead_gain = 0`; on this session 0.9 at 250 ms was
-best with fast quoting, but a second session (below) favours 0.3-0.6. Spot as a factor observer (`ref_gain`) is off: with both markets at
+best with fast quoting, a second session (below) favoured 0.3-0.6, and a
+ten-hour third session reversed both at the quote lives the config uses. Spot as a factor observer (`ref_gain`) is off: with both markets at
 gain 1 the factor snaps to whichever ticked last, and the perpetual ticks
 several hundred times a second, so spot's information is erased within
 milliseconds.
@@ -691,6 +692,50 @@ worst session at every quote life; the improvement comes mostly from the
 second session (on the first, at 30 s, no lead is narrowly best). At zero
 fee the 30 s row is not monotone in the gain: path noise is as large as the
 effect there. A third session decides whether the config turns it on.
+
+*A third session, ten hours* (2026-11-18 20:29 to 2026-11-19 06:29 UTC,
+Binance spot and perpetuals and Bybit perpetuals, 55M events, no gap longer
+than 20 s on any market). The perpetual-to-perpetual picture is the same as
+on the 17th: the cross-correlation is close to symmetric (BTC 0.65
+Binance-first against 0.61 Bybit-first, ETH 0.62 against 0.48), with
+Binance's moves followed in full by Bybit within 200 ms and Bybit's by
+Binance only to 86-91% within a second. Spot against the perpetual: the
+perpetual leads (0.84 against 0.56), and after a 1 bp perpetual move spot
+makes 44% of it in the same step and 99% within a second, as on the 16th.
+The momentum signal itself held, at the first session's strength and stable
+across the two halves: spot's move (tau 100 ms) predicts the perpetual's next
+250 ms with coefficient 0.48-0.62 and R² 2-3%, and Bybit's predicts Binance's
+equally well this time (0.40-0.51, R² 2-3%, both halves alike). So the signal
+is real; the question below is only whether quoting on it pays.
+
+Swept with the other two (`amm_sweep --replay` three times, 6 copies each,
+tau 250 ms; mean P&L on this session, the three-session total in brackets):
+
+| maker fee, quote life | gain 0 | 0.3 | 0.6 | 0.9 |
+| --- | --- | --- | --- | --- |
+| 0.02%, 30 s | -39.1 (-50.9) | -51.6 (-62.3) | -112.8 (-120.2) | -64.4 (-71.2) |
+| 0.02%, 5 s | -49.2 (-76.2) | -92.5 (-122.2) | -137.4 (-156.4) | -105.8 (-126.4) |
+| 0.02%, 1 s | -156.6 (-187.3) | -122.7 (-146.9) | -144.2 (-169.1) | -142.3 (-159.1) |
+| zero, 30 s | -38.1 (-36.8) | -17.9 (-12.7) | -76.2 (-80.9) | -54.6 (-44.3) |
+| zero, 5 s | -148.5 (-217.2) | -105.5 (-177.6) | -102.0 (-177.0) | -94.3 (-157.6) |
+| zero, 1 s | -177.9 (-231.1) | -173.9 (-213.5) | -134.1 (-172.2) | -118.1 (-157.4) |
+
+At the 0.02% tier and the quote lives the config uses (5-30 s), gains of 0.6
+and 0.9 lose on this session by more than the copy-to-copy spread (no-lead
+copies range from -100 to +7 at 30 s; the gain-0.6 copies all sit at -113),
+gain 0.3 is within the noise, and the loss outweighs what the lead gained on
+the other two: no lead has the best three-session total at 30 s and 5 s. The
+lead helps where fills are many and short-lived (1 s quotes, and zero fee at
+5 s): it cuts fills by up to half and the loss by a fifth to a third on this
+session, so it does avoid adverse fills, but with slow quoting at the fee-paying
+tier the fills it keeps are not enough better to pay for those it gives up.
+**The configs keep `lead_gain = 0`.** The term stays in the engine for fast
+quoting at a zero or rebate tier, where gain 0.6-0.9 beat no lead on all three
+sessions at 1 s.
+
+All three sessions lose at the 0.02% tier under every setting tried; on the
+ten-hour one both perpetuals reached the position limit.
+The open questions are inventory and fee tier, not the lead.
 
 **Verified and not verified.** Tests cover the event format, the config
 files, the paper venue's fill rules, replay determinism (a session recorded
